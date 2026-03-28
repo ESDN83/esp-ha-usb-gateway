@@ -12,6 +12,7 @@
 #include "usb/vcp_ftdi.hpp"
 #include "usb/vcp.hpp"
 
+// lwip defines socket/bind/etc. as macros — include then undef to use POSIX API
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 #include "esp_netif.h"
@@ -71,7 +72,7 @@ class UsbBridgeComponent : public Component {
     }
 
     // Register FTDI VCP driver (supports FTDI FT232 based USB serial devices)
-    VCP::register_driver<FtdiDevice>();
+    esp_usb::VCP::register_driver<esp_usb::FtdiDevice>();
 
     // Start worker tasks
     xTaskCreatePinnedToCore(usb_task_entry_, "usb_mon", 4096,
@@ -111,7 +112,7 @@ class UsbBridgeComponent : public Component {
 
     int fd = instance_->tcp_client_fd_.load();
     if (fd >= 0) {
-      send(fd, data, data_len, MSG_DONTWAIT);
+      lwip_send(fd, data, data_len, MSG_DONTWAIT);
     }
     return true;
   }
@@ -151,13 +152,12 @@ class UsbBridgeComponent : public Component {
         const cdc_acm_host_device_config_t dev_config = {
             .connection_timeout_ms = 5000,
             .out_buffer_size = 512,
-            .in_buffer_size = 512,
             .event_cb = handle_event_,
             .data_cb = handle_rx_,
             .user_arg = nullptr,
         };
 
-        auto vcp = std::unique_ptr<CdcAcmDevice>(VCP::open(&dev_config));
+        auto vcp = std::unique_ptr<CdcAcmDevice>(esp_usb::VCP::open(&dev_config));
         if (vcp) {
           cdc_acm_line_coding_t line_coding = {
               .dwDTERate = static_cast<uint32_t>(baud_rate_),
@@ -194,7 +194,7 @@ class UsbBridgeComponent : public Component {
     vTaskDelay(pdMS_TO_TICKS(5000));
 
     while (true) {
-      int server_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+      int server_fd = lwip_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
       if (server_fd < 0) {
         ESP_LOGE(TAG, "socket() failed: errno %d", errno);
         vTaskDelay(pdMS_TO_TICKS(5000));
@@ -202,23 +202,23 @@ class UsbBridgeComponent : public Component {
       }
 
       int opt = 1;
-      setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+      lwip_setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
       struct sockaddr_in addr = {};
       addr.sin_family = AF_INET;
       addr.sin_addr.s_addr = INADDR_ANY;
       addr.sin_port = htons(tcp_port_);
 
-      if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+      if (lwip_bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         ESP_LOGE(TAG, "bind() port %d failed: errno %d", tcp_port_, errno);
-        close(server_fd);
+        lwip_close(server_fd);
         vTaskDelay(pdMS_TO_TICKS(5000));
         continue;
       }
 
-      if (listen(server_fd, 1) < 0) {
+      if (lwip_listen(server_fd, 1) < 0) {
         ESP_LOGE(TAG, "listen() failed: errno %d", errno);
-        close(server_fd);
+        lwip_close(server_fd);
         vTaskDelay(pdMS_TO_TICKS(5000));
         continue;
       }
@@ -229,7 +229,7 @@ class UsbBridgeComponent : public Component {
       while (true) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
-        int client_fd = accept(server_fd,
+        int client_fd = lwip_accept(server_fd,
                                (struct sockaddr *)&client_addr, &client_len);
         if (client_fd < 0) {
           ESP_LOGE(TAG, "accept() failed: errno %d", errno);
@@ -242,14 +242,14 @@ class UsbBridgeComponent : public Component {
 
         // Enable TCP keepalive
         opt = 1;
-        setsockopt(client_fd, SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof(opt));
+        lwip_setsockopt(client_fd, SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof(opt));
 
         tcp_client_fd_.store(client_fd);
 
         // Forward TCP → USB (USB → TCP happens in handle_rx_ callback)
         uint8_t buf[256];
         while (true) {
-          int len = recv(client_fd, buf, sizeof(buf), 0);
+          int len = lwip_recv(client_fd, buf, sizeof(buf), 0);
           if (len <= 0) {
             if (len < 0) {
               ESP_LOGW(TAG, "recv() error: errno %d", errno);
@@ -271,10 +271,10 @@ class UsbBridgeComponent : public Component {
 
         ESP_LOGI(TAG, "Client disconnected: %s", addr_str);
         tcp_client_fd_.store(-1);
-        close(client_fd);
+        lwip_close(client_fd);
       }
 
-      close(server_fd);
+      lwip_close(server_fd);
     }
   }
 };
