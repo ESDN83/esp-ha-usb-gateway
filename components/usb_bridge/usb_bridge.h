@@ -72,7 +72,7 @@ class UsbBridgeComponent : public Component {
     }
 
     // Register FTDI VCP driver (supports FTDI FT232 based USB serial devices)
-    esp_usb::VCP::register_driver<esp_usb::FtdiDevice>();
+    esp_usb::VCP::register_driver<esp_usb::FT23x>();
 
     // Start worker tasks
     xTaskCreatePinnedToCore(usb_task_entry_, "usb_mon", 4096,
@@ -107,14 +107,13 @@ class UsbBridgeComponent : public Component {
   }
 
   // ── USB RX callback → forward to TCP client ─────────────────
-  static bool handle_rx_(const uint8_t *data, size_t data_len, void *arg) {
-    if (!instance_ || data_len == 0) return true;
+  static void handle_rx_(uint8_t *data, size_t data_len, void *arg) {
+    if (!instance_ || data_len == 0) return;
 
     int fd = instance_->tcp_client_fd_.load();
     if (fd >= 0) {
       lwip_send(fd, data, data_len, MSG_DONTWAIT);
     }
-    return true;
   }
 
   // ── USB device event callback ──────────────────────────────
