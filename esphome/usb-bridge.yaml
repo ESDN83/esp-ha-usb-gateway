@@ -14,11 +14,14 @@ esp32:
       CONFIG_USB_OTG_SUPPORTED: "y"
       CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE: "1024"
 
-# USB Bridge component (local)
+# USB Bridge component from GitHub
 external_components:
   - source:
-      type: local
-      path: components
+      type: git
+      url: https://github.com/ESDN83/esp-ha-usb-gateway
+      ref: master
+    components: [usb_bridge]
+    refresh: 1d
 
 wifi:
   ssid: !secret wifi_ssid
