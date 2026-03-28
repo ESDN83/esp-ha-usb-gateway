@@ -9,6 +9,7 @@
 
 #include "usb/usb_host.h"
 #include "usb/cdc_acm_host.h"
+#include <array>  // required before vcp_ftdi.hpp (missing include in v1.0.0)
 #include "usb/vcp_ftdi.hpp"
 #include "usb/vcp.hpp"
 
