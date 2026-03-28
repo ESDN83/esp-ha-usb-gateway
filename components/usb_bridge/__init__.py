@@ -35,3 +35,7 @@ async def to_code(config):
     # Enable USB OTG and C++ exceptions (required by VCP/FTDI components)
     add_idf_sdkconfig_option("CONFIG_USB_OTG_SUPPORTED", True)
     add_idf_sdkconfig_option("CONFIG_COMPILER_CXX_EXCEPTIONS", True)
+
+    # Workaround: ftdi_vcp v1.0.0 header bug - missing #include <array>
+    cg.add_build_flag("-include")
+    cg.add_build_flag("array")
