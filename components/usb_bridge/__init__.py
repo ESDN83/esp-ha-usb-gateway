@@ -26,16 +26,26 @@ async def to_code(config):
     cg.add(var.set_tcp_port(config[CONF_TCP_PORT]))
     cg.add(var.set_baud_rate(config[CONF_BAUD_RATE]))
 
-    # ESP-IDF Component Registry dependencies
-    # All must use 1.x series: vcp 1.0.0 requires cdc_acm ^1.0.4 (<2.0.0)
-    add_idf_component(name="espressif/usb_host_cdc_acm", ref="1.0.4")
-    add_idf_component(name="espressif/usb_host_vcp", ref="1.0.0")
-    add_idf_component(name="espressif/usb_host_ftdi_vcp", ref="1.0.0")
+    # USB Host components from esp-usb Git repo (latest, all compatible)
+    # Using git source avoids: 1) registry version conflicts, 2) ftdi v1.0.0 <array> bug
+    ESP_USB_REPO = "https://github.com/espressif/esp-usb.git"
+    ESP_USB_REF = "master"
+    add_idf_component(
+        name="usb_host_cdc_acm",
+        repo=ESP_USB_REPO, ref=ESP_USB_REF,
+        path="host/class/cdc/usb_host_cdc_acm",
+    )
+    add_idf_component(
+        name="usb_host_vcp",
+        repo=ESP_USB_REPO, ref=ESP_USB_REF,
+        path="host/class/cdc/usb_host_vcp",
+    )
+    add_idf_component(
+        name="usb_host_ftdi_vcp",
+        repo=ESP_USB_REPO, ref=ESP_USB_REF,
+        path="host/class/cdc/usb_host_ftdi_vcp",
+    )
 
     # Enable USB OTG and C++ exceptions (required by VCP/FTDI components)
     add_idf_sdkconfig_option("CONFIG_USB_OTG_SUPPORTED", True)
     add_idf_sdkconfig_option("CONFIG_COMPILER_CXX_EXCEPTIONS", True)
-
-    # Workaround: ftdi_vcp v1.0.0 header bug - missing #include <array>
-    cg.add_build_flag("-include")
-    cg.add_build_flag("array")
