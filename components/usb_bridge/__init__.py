@@ -27,9 +27,10 @@ async def to_code(config):
     cg.add(var.set_baud_rate(config[CONF_BAUD_RATE]))
 
     # ESP-IDF Component Registry dependencies
-    add_idf_component(name="espressif/usb_host_cdc_acm", ref="2.0.0")
+    # All must use 1.x series: vcp 1.0.0 requires cdc_acm ^1.0.4 (<2.0.0)
+    add_idf_component(name="espressif/usb_host_cdc_acm", ref="1.0.4")
     add_idf_component(name="espressif/usb_host_vcp", ref="1.0.0")
-    add_idf_component(name="espressif/usb_host_ftdi_vcp", ref="2.0.0")
+    add_idf_component(name="espressif/usb_host_ftdi_vcp", ref="1.0.0")
 
     # Enable USB OTG in sdkconfig
     add_idf_sdkconfig_option("CONFIG_USB_OTG_SUPPORTED", True)
