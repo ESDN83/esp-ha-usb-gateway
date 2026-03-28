@@ -1,7 +1,7 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome.const import CONF_ID, CONF_BAUD_RATE
-from esphome.components.esp32 import add_idf_sdkconfig_option, add_idf_component
+from esphome.components.esp32 import add_idf_sdkconfig_option
 
 DEPENDENCIES = ["network"]
 CODEOWNERS = []
@@ -26,26 +26,6 @@ async def to_code(config):
     cg.add(var.set_tcp_port(config[CONF_TCP_PORT]))
     cg.add(var.set_baud_rate(config[CONF_BAUD_RATE]))
 
-    # USB Host components from esp-usb Git repo (latest, all compatible)
-    # Using git source avoids: 1) registry version conflicts, 2) ftdi v1.0.0 <array> bug
-    ESP_USB_REPO = "https://github.com/espressif/esp-usb.git"
-    ESP_USB_REF = "master"
-    add_idf_component(
-        name="usb_host_cdc_acm",
-        repo=ESP_USB_REPO, ref=ESP_USB_REF,
-        path="host/class/cdc/usb_host_cdc_acm",
-    )
-    add_idf_component(
-        name="usb_host_vcp",
-        repo=ESP_USB_REPO, ref=ESP_USB_REF,
-        path="host/class/cdc/usb_host_vcp",
-    )
-    add_idf_component(
-        name="usb_host_ftdi_vcp",
-        repo=ESP_USB_REPO, ref=ESP_USB_REF,
-        path="host/class/cdc/usb_host_ftdi_vcp",
-    )
-
-    # Enable USB OTG and C++ exceptions (required by VCP/FTDI components)
+    # No external IDF components needed — uses only the built-in USB Host API
     add_idf_sdkconfig_option("CONFIG_USB_OTG_SUPPORTED", True)
-    add_idf_sdkconfig_option("CONFIG_COMPILER_CXX_EXCEPTIONS", True)
+    add_idf_sdkconfig_option("CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE", 1024)
