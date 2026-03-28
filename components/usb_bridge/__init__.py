@@ -32,5 +32,6 @@ async def to_code(config):
     add_idf_component(name="espressif/usb_host_vcp", ref="1.0.0")
     add_idf_component(name="espressif/usb_host_ftdi_vcp", ref="1.0.0")
 
-    # Enable USB OTG in sdkconfig
+    # Enable USB OTG and C++ exceptions (required by VCP/FTDI components)
     add_idf_sdkconfig_option("CONFIG_USB_OTG_SUPPORTED", True)
+    add_idf_sdkconfig_option("CONFIG_COMPILER_CXX_EXCEPTIONS", True)
