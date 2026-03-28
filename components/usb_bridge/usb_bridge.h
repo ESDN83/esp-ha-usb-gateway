@@ -136,7 +136,7 @@ class UsbBridgeComponent : public Component {
 
     // Check device descriptor for FTDI VID:PID
     const usb_device_desc_t *desc;
-    err = usb_host_get_device_desc(dev, &desc);
+    err = usb_host_get_device_descriptor(dev, &desc);
     if (err != ESP_OK || desc->idVendor != FTDI_VID || desc->idProduct != FTDI_PID_FT232) {
       ESP_LOGD(TAG, "Not FTDI FT232 (VID=%04X PID=%04X), skipping",
                desc ? desc->idVendor : 0, desc ? desc->idProduct : 0);
