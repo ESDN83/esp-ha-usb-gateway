@@ -31,7 +31,8 @@ wifi:
     ssid: "USB-Bridge"
     password: "usbbridge123"
 
-captive_portal:
+# captive_portal removed — conflicts with USB config UI on port 80
+# WiFi is already configured, captive portal not needed
 
 logger:
   level: DEBUG
