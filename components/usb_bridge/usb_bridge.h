@@ -33,24 +33,6 @@ static constexpr uint8_t FTDI_REQ_SET_DATA = 0x04;
 // CDC-ACM class requests
 static constexpr uint8_t CDC_SET_LINE_CODING = 0x20;
 
-// USB Hub class requests
-static constexpr uint8_t HUB_REQ_GET_DESCRIPTOR = 0x06;
-static constexpr uint8_t HUB_REQ_SET_FEATURE = 0x03;
-static constexpr uint8_t HUB_REQ_GET_STATUS = 0x00;
-static constexpr uint8_t HUB_REQ_CLEAR_FEATURE = 0x01;
-
-// Hub port features
-static constexpr uint16_t HUB_PORT_POWER = 8;
-static constexpr uint16_t HUB_PORT_RESET = 4;
-static constexpr uint16_t HUB_C_PORT_CONNECTION = 16;
-static constexpr uint16_t HUB_C_PORT_RESET = 20;
-
-// Hub port status bits
-static constexpr uint16_t HUB_PORT_STATUS_CONNECTION = (1 << 0);
-static constexpr uint16_t HUB_PORT_STATUS_ENABLE = (1 << 1);
-static constexpr uint16_t HUB_PORT_STATUS_RESET = (1 << 4);
-static constexpr uint16_t HUB_PORT_STATUS_POWER = (1 << 8);
-
 // USB class codes
 #ifndef USB_CLASS_CDC
 #define USB_CLASS_CDC 0x02
@@ -90,6 +72,26 @@ class UsbBridgeComponent : public Component {
       return;
     }
 
+    // Register client BEFORE starting the lib task to avoid race condition:
+    // lib task seeing "no clients" → usb_host_device_free_all() → disrupts
+    // hub enumeration → sets event_pending → root port reset rejected
+    const usb_host_client_config_t client_config = {
+        .is_synchronous = false,
+        .max_num_event_msg = 5,
+        .async = {
+            .client_event_callback = client_event_cb_,
+            .callback_arg = this,
+        },
+    };
+    err = usb_host_client_register(&client_config, &client_hdl_);
+    if (err != ESP_OK) {
+      ESP_LOGE(TAG, "Client register failed: %s", esp_err_to_name(err));
+      this->mark_failed();
+      return;
+    }
+
+    ESP_LOGI(TAG, "USB host client registered");
+
     xTaskCreatePinnedToCore(usb_lib_task_, "usb_lib", 8192,
                             nullptr, 10, nullptr, 0);
     xTaskCreatePinnedToCore(usb_task_entry_, "usb_mon", 8192,
@@ -117,10 +119,7 @@ class UsbBridgeComponent : public Component {
   uint8_t claimed_intf_{0};
   ChipType chip_type_{ChipType::UNKNOWN};
 
-  // Deferred hub handling — cannot do control transfers inside event callback
-  std::atomic<uint8_t> pending_hub_addr_{0};
-
-  // Synchronous control transfer support
+// Synchronous control transfer support
   SemaphoreHandle_t ctrl_xfer_done_{nullptr};
   usb_transfer_status_t ctrl_xfer_status_{};
   uint16_t ctrl_xfer_actual_{0};
@@ -134,9 +133,9 @@ class UsbBridgeComponent : public Component {
     while (true) {
       uint32_t event_flags;
       usb_host_lib_handle_events(portMAX_DELAY, &event_flags);
-      if (event_flags & USB_HOST_LIB_EVENT_FLAGS_NO_CLIENTS) {
-        usb_host_device_free_all();
-      }
+      // Don't call usb_host_device_free_all() — we never deregister our
+      // client, and freeing devices during enumeration disrupts the hub
+      // driver (sets event_pending → root port reset rejected).
     }
   }
 
@@ -221,130 +220,7 @@ class UsbBridgeComponent : public Component {
     return ESP_OK;
   }
 
-  // ── Hub management ────────────────────────────────────────
-  bool handle_hub_(usb_device_handle_t dev) {
-    // Get hub descriptor to find number of ports
-    uint8_t hub_desc[16] = {};
-    esp_err_t err = ctrl_transfer_sync_(
-        dev,
-        USB_BM_REQUEST_TYPE_DIR_IN | USB_BM_REQUEST_TYPE_TYPE_CLASS |
-            USB_BM_REQUEST_TYPE_RECIP_DEVICE,
-        HUB_REQ_GET_DESCRIPTOR,
-        0x2900,  // Hub Descriptor type
-        0, 8, hub_desc);
-
-    uint8_t num_ports = 0;
-    if (err == ESP_OK) {
-      num_ports = hub_desc[2];
-      ESP_LOGI(TAG, "USB Hub has %d ports", num_ports);
-    } else {
-      ESP_LOGW(TAG, "Get hub descriptor failed: %s, assuming 4 ports",
-               esp_err_to_name(err));
-      num_ports = 4;
-    }
-
-    if (num_ports > 8) num_ports = 8;
-
-    // Power on each port
-    for (int port = 1; port <= num_ports; port++) {
-      err = ctrl_transfer_sync_(
-          dev,
-          USB_BM_REQUEST_TYPE_DIR_OUT | USB_BM_REQUEST_TYPE_TYPE_CLASS |
-              USB_BM_REQUEST_TYPE_RECIP_OTHER,
-          HUB_REQ_SET_FEATURE,
-          HUB_PORT_POWER,
-          port, 0);
-      if (err == ESP_OK) {
-        ESP_LOGD(TAG, "Hub port %d powered on", port);
-      } else {
-        ESP_LOGW(TAG, "Hub port %d power failed: %s", port, esp_err_to_name(err));
-      }
-    }
-
-    // Wait for ports to power up
-    vTaskDelay(pdMS_TO_TICKS(200));
-
-    // Check each port for connected devices and reset them
-    for (int port = 1; port <= num_ports; port++) {
-      uint8_t status_buf[4] = {};
-      err = ctrl_transfer_sync_(
-          dev,
-          USB_BM_REQUEST_TYPE_DIR_IN | USB_BM_REQUEST_TYPE_TYPE_CLASS |
-              USB_BM_REQUEST_TYPE_RECIP_OTHER,
-          HUB_REQ_GET_STATUS,
-          0, port, 4, status_buf);
-
-      if (err != ESP_OK) {
-        ESP_LOGD(TAG, "Hub port %d get_status failed", port);
-        continue;
-      }
-
-      uint16_t port_status = status_buf[0] | (status_buf[1] << 8);
-      ESP_LOGD(TAG, "Hub port %d status: 0x%04X", port, port_status);
-
-      if (!(port_status & HUB_PORT_STATUS_CONNECTION)) {
-        ESP_LOGD(TAG, "Hub port %d: no device", port);
-        continue;
-      }
-
-      ESP_LOGI(TAG, "Hub port %d: device connected, resetting...", port);
-
-      // Clear connection change
-      ctrl_transfer_sync_(
-          dev,
-          USB_BM_REQUEST_TYPE_DIR_OUT | USB_BM_REQUEST_TYPE_TYPE_CLASS |
-              USB_BM_REQUEST_TYPE_RECIP_OTHER,
-          HUB_REQ_CLEAR_FEATURE,
-          HUB_C_PORT_CONNECTION,
-          port, 0);
-
-      // Reset the port
-      err = ctrl_transfer_sync_(
-          dev,
-          USB_BM_REQUEST_TYPE_DIR_OUT | USB_BM_REQUEST_TYPE_TYPE_CLASS |
-              USB_BM_REQUEST_TYPE_RECIP_OTHER,
-          HUB_REQ_SET_FEATURE,
-          HUB_PORT_RESET,
-          port, 0);
-
-      if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Hub port %d reset failed: %s", port, esp_err_to_name(err));
-        continue;
-      }
-
-      // Wait for reset to complete
-      vTaskDelay(pdMS_TO_TICKS(100));
-
-      // Clear reset change
-      ctrl_transfer_sync_(
-          dev,
-          USB_BM_REQUEST_TYPE_DIR_OUT | USB_BM_REQUEST_TYPE_TYPE_CLASS |
-              USB_BM_REQUEST_TYPE_RECIP_OTHER,
-          HUB_REQ_CLEAR_FEATURE,
-          HUB_C_PORT_RESET,
-          port, 0);
-
-      // Check port is now enabled
-      err = ctrl_transfer_sync_(
-          dev,
-          USB_BM_REQUEST_TYPE_DIR_IN | USB_BM_REQUEST_TYPE_TYPE_CLASS |
-              USB_BM_REQUEST_TYPE_RECIP_OTHER,
-          HUB_REQ_GET_STATUS,
-          0, port, 4, status_buf);
-
-      if (err == ESP_OK) {
-        port_status = status_buf[0] | (status_buf[1] << 8);
-        ESP_LOGI(TAG, "Hub port %d after reset: status=0x%04X %s%s",
-                 port, port_status,
-                 (port_status & HUB_PORT_STATUS_CONNECTION) ? "CONN " : "",
-                 (port_status & HUB_PORT_STATUS_ENABLE) ? "ENABLE" : "");
-      }
-    }
-
-    return true;
-  }
-
-  // ── Detect chip type from device descriptor ───────────────
+// ── Detect chip type from device descriptor ───────────────
   ChipType detect_chip_type_(const usb_device_desc_t *desc,
                              const usb_config_desc_t *config_desc) {
     if (desc->idVendor == FTDI_VID) {

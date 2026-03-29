@@ -132,14 +132,14 @@ the base USB OTG option only.
 
 ### 7. Root port reset failed (2026-03-29)
 - **Error**: `E (xxxxx) HUB: Root port reset failed` — repeats continuously
-- **Source**: ESP-IDF's internal HUB component, before our code runs
-- **Root cause**: Known ESP-IDF timing issue (GitHub issues #10086, #12412, #13933, #17918)
-  - Devices already plugged in at boot can fail enumeration
-  - Hub slow to respond to root port reset within default timeout
-  - `CONFIG_USB_HOST_HUBS_SUPPORTED` was NOT set (only multi-level was set)
-- **Fix**: Enable `CONFIG_USB_HOST_HUBS_SUPPORTED`, increase timing parameters
-  (`DEBOUNCE_DELAY_MS`, `RESET_HOLD_MS`, `RESET_RECOVERY_MS`), increase
-  usb_lib task stack size (hub driver runs inside it)
+- **Source**: ESP-IDF's internal HUB component.
+- **Root cause**: Race condition in client registration vs library daemon task.
+  - If `usb_lib_task_` runs `usb_host_lib_handle_events()` before any client is registered, it calls `usb_host_device_free_all()`.
+  - This disrupts the built-in hub enumeration and sets `event_pending`.
+  - A subsequent `hcd_port_command(RESET)` fails immediately if `event_pending` is true, without retry.
+- **Fix**: 
+  - Register the USB client in `setup()` *before* starting `usb_lib_task_`.
+  - Remove `usb_host_device_free_all()` from the `usb_lib_task_` loop since we never deregister the client anyway.
 - **References**:
   - https://github.com/espressif/esp-idf/issues/10086
   - https://github.com/espressif/esp-idf/issues/12412
