@@ -494,7 +494,11 @@ class UsbBridgeComponent : public Component {
     xfer->callback = bulk_in_cb_;
     xfer->context = this;
     xfer->num_bytes = bulk_in_mps_;
-    xfer->timeout_ms = 500;
+    xfer->timeout_ms = 1000; // Increased to 1 sec, will be re-submitted automatically
+
+    // Instead of a dangerous polling loop that causes ESP_ERR_NOT_FINISHED and crashes,
+    // we use a semaphore to perfectly sync the async transfer submissions.
+    bulk_in_sem_ = xSemaphoreCreateBinary();
 
     while (usb_connected_.load()) {
       err = usb_host_transfer_submit(xfer);
@@ -502,32 +506,53 @@ class UsbBridgeComponent : public Component {
         if (usb_connected_.load()) {
           ESP_LOGW(TAG, "Bulk IN submit failed: %s", esp_err_to_name(err));
         }
-        break;
+        break; // Stop submitting and exit the read task
       }
-      vTaskDelay(pdMS_TO_TICKS(10));
+      
+      // Wait for the asynchronous transfer to complete and trigger bulk_in_cb_
+      xSemaphoreTake(bulk_in_sem_, portMAX_DELAY);
     }
 
+    // Since we wait for the semaphore, it is guaranteed the transfer is No Longer in-flight!
+    // We can safely free it without crashing the ESP-IDF USB daemon.
     usb_host_transfer_free(xfer);
+    vSemaphoreDelete(bulk_in_sem_);
+    bulk_in_sem_ = nullptr;
+    
     ESP_LOGI(TAG, "Bulk read task ended");
     vTaskDelete(nullptr);
   }
 
+  SemaphoreHandle_t bulk_in_sem_{nullptr};
+
   static void bulk_in_cb_(usb_transfer_t *xfer) {
     auto *self = static_cast<UsbBridgeComponent *>(xfer->context);
-    if (xfer->status != USB_TRANSFER_STATUS_COMPLETED || xfer->actual_num_bytes == 0) return;
+    
+    // Process data if completed successfully
+    if (xfer->status == USB_TRANSFER_STATUS_COMPLETED && xfer->actual_num_bytes > 0) {
+      const uint8_t *data = xfer->data_buffer;
+      size_t len = xfer->actual_num_bytes;
 
-    const uint8_t *data = xfer->data_buffer;
-    size_t len = xfer->actual_num_bytes;
-
-    if (self->chip_type_ == ChipType::FTDI) {
-      if (len <= 2) return;
-      data += 2;
-      len -= 2;
+      if (self->chip_type_ == ChipType::FTDI) {
+        if (len > 2) {
+          data += 2;
+          len -= 2;
+          int fd = self->tcp_client_fd_.load();
+          if (fd >= 0) {
+            lwip_send(fd, data, len, MSG_DONTWAIT);
+          }
+        }
+      } else {
+        int fd = self->tcp_client_fd_.load();
+        if (fd >= 0) {
+          lwip_send(fd, data, len, MSG_DONTWAIT);
+        }
+      }
     }
 
-    int fd = self->tcp_client_fd_.load();
-    if (fd >= 0 && len > 0) {
-      lwip_send(fd, data, len, MSG_DONTWAIT);
+    // Always signal the main read task that the transfer cycle finished
+    if (self->bulk_in_sem_) {
+      xSemaphoreGive(self->bulk_in_sem_);
     }
   }
 
