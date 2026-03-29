@@ -24,7 +24,7 @@ static const char *const TAG = "usb_bridge";
 // Known USB serial chip vendors
 static constexpr uint16_t FTDI_VID = 0x0403;
 
-// FTDI vendor requests (bmRequestType = 0x40 host-to-device, vendor)
+// FTDI vendor requests
 static constexpr uint8_t FTDI_REQ_RESET = 0x00;
 static constexpr uint8_t FTDI_REQ_SET_FLOW_CTRL = 0x02;
 static constexpr uint8_t FTDI_REQ_SET_BAUDRATE = 0x03;
@@ -33,16 +33,34 @@ static constexpr uint8_t FTDI_REQ_SET_DATA = 0x04;
 // CDC-ACM class requests
 static constexpr uint8_t CDC_SET_LINE_CODING = 0x20;
 
-// USB class codes (use ESP-IDF macros where available, define missing ones)
+// USB Hub class requests
+static constexpr uint8_t HUB_REQ_GET_DESCRIPTOR = 0x06;
+static constexpr uint8_t HUB_REQ_SET_FEATURE = 0x03;
+static constexpr uint8_t HUB_REQ_GET_STATUS = 0x00;
+static constexpr uint8_t HUB_REQ_CLEAR_FEATURE = 0x01;
+
+// Hub port features
+static constexpr uint16_t HUB_PORT_POWER = 8;
+static constexpr uint16_t HUB_PORT_RESET = 4;
+static constexpr uint16_t HUB_C_PORT_CONNECTION = 16;
+static constexpr uint16_t HUB_C_PORT_RESET = 20;
+
+// Hub port status bits
+static constexpr uint16_t HUB_PORT_STATUS_CONNECTION = (1 << 0);
+static constexpr uint16_t HUB_PORT_STATUS_ENABLE = (1 << 1);
+static constexpr uint16_t HUB_PORT_STATUS_RESET = (1 << 4);
+static constexpr uint16_t HUB_PORT_STATUS_POWER = (1 << 8);
+
+// USB class codes
 #ifndef USB_CLASS_CDC
 #define USB_CLASS_CDC 0x02
 #endif
 
 enum class ChipType : uint8_t {
   UNKNOWN = 0,
-  FTDI,      // FT232, FT231 etc. — vendor-specific, 2-byte status prefix
-  CDC_ACM,   // Standard CDC-ACM (e.g. Arduino, some CP210x, CH340 in CDC mode)
-  GENERIC,   // Has bulk endpoints but unknown protocol
+  FTDI,
+  CDC_ACM,
+  GENERIC,
 };
 
 class UsbBridgeComponent : public Component {
@@ -59,6 +77,7 @@ class UsbBridgeComponent : public Component {
              tcp_port_, baud_rate_);
 
     instance_ = this;
+    ctrl_xfer_done_ = xSemaphoreCreateBinary();
 
     const usb_host_config_t host_config = {
         .skip_phy_setup = false,
@@ -73,7 +92,7 @@ class UsbBridgeComponent : public Component {
 
     xTaskCreatePinnedToCore(usb_lib_task_, "usb_lib", 4096,
                             nullptr, 10, nullptr, 0);
-    xTaskCreatePinnedToCore(usb_task_entry_, "usb_mon", 4096,
+    xTaskCreatePinnedToCore(usb_task_entry_, "usb_mon", 8192,
                             this, 5, nullptr, 1);
     xTaskCreatePinnedToCore(tcp_task_entry_, "tcp_srv", 8192,
                             this, 5, nullptr, 1);
@@ -91,11 +110,17 @@ class UsbBridgeComponent : public Component {
 
   usb_host_client_handle_t client_hdl_{nullptr};
   usb_device_handle_t dev_hdl_{nullptr};
+  usb_device_handle_t hub_hdl_{nullptr};
   uint8_t bulk_in_ep_{0};
   uint8_t bulk_out_ep_{0};
   uint16_t bulk_in_mps_{64};
   uint8_t claimed_intf_{0};
   ChipType chip_type_{ChipType::UNKNOWN};
+
+  // Synchronous control transfer support
+  SemaphoreHandle_t ctrl_xfer_done_{nullptr};
+  usb_transfer_status_t ctrl_xfer_status_{};
+  uint16_t ctrl_xfer_actual_{0};
 
   std::atomic<bool> usb_connected_{false};
   std::atomic<int> tcp_client_fd_{-1};
@@ -130,16 +155,200 @@ class UsbBridgeComponent : public Component {
     }
   }
 
+  // ── Synchronous control transfer ──────────────────────────
+  static void ctrl_xfer_sync_cb_(usb_transfer_t *xfer) {
+    auto *self = static_cast<UsbBridgeComponent *>(xfer->context);
+    self->ctrl_xfer_status_ = xfer->status;
+    self->ctrl_xfer_actual_ = xfer->actual_num_bytes;
+    xSemaphoreGive(self->ctrl_xfer_done_);
+  }
+
+  esp_err_t ctrl_transfer_sync_(usb_device_handle_t dev,
+                                 uint8_t bmRequestType, uint8_t bRequest,
+                                 uint16_t wValue, uint16_t wIndex,
+                                 uint16_t wLength, uint8_t *data_out = nullptr) {
+    usb_transfer_t *xfer;
+    size_t alloc_size = sizeof(usb_setup_packet_t) + wLength;
+    esp_err_t err = usb_host_transfer_alloc(alloc_size, 0, &xfer);
+    if (err != ESP_OK) return err;
+
+    usb_setup_packet_t *setup = (usb_setup_packet_t *)xfer->data_buffer;
+    setup->bmRequestType = bmRequestType;
+    setup->bRequest = bRequest;
+    setup->wValue = wValue;
+    setup->wIndex = wIndex;
+    setup->wLength = wLength;
+
+    xfer->device_handle = dev;
+    xfer->bEndpointAddress = 0;
+    xfer->callback = ctrl_xfer_sync_cb_;
+    xfer->context = this;
+    xfer->num_bytes = sizeof(usb_setup_packet_t) + wLength;
+    xfer->timeout_ms = 2000;
+
+    // Reset semaphore
+    xSemaphoreTake(ctrl_xfer_done_, 0);
+
+    err = usb_host_transfer_submit_control(client_hdl_, xfer);
+    if (err != ESP_OK) {
+      usb_host_transfer_free(xfer);
+      return err;
+    }
+
+    // Wait for completion
+    if (xSemaphoreTake(ctrl_xfer_done_, pdMS_TO_TICKS(3000)) != pdTRUE) {
+      usb_host_transfer_free(xfer);
+      return ESP_ERR_TIMEOUT;
+    }
+
+    if (ctrl_xfer_status_ != USB_TRANSFER_STATUS_COMPLETED) {
+      usb_host_transfer_free(xfer);
+      return ESP_FAIL;
+    }
+
+    // Copy received data if this was an IN transfer
+    if ((bmRequestType & USB_BM_REQUEST_TYPE_DIR_IN) && data_out && wLength > 0) {
+      size_t copy_len = ctrl_xfer_actual_ > sizeof(usb_setup_packet_t)
+                        ? ctrl_xfer_actual_ - sizeof(usb_setup_packet_t) : 0;
+      if (copy_len > wLength) copy_len = wLength;
+      memcpy(data_out, xfer->data_buffer + sizeof(usb_setup_packet_t), copy_len);
+    }
+
+    usb_host_transfer_free(xfer);
+    return ESP_OK;
+  }
+
+  // ── Hub management ────────────────────────────────────────
+  bool handle_hub_(usb_device_handle_t dev) {
+    // Get hub descriptor to find number of ports
+    uint8_t hub_desc[16] = {};
+    esp_err_t err = ctrl_transfer_sync_(
+        dev,
+        USB_BM_REQUEST_TYPE_DIR_IN | USB_BM_REQUEST_TYPE_TYPE_CLASS |
+            USB_BM_REQUEST_TYPE_RECIP_DEVICE,
+        HUB_REQ_GET_DESCRIPTOR,
+        0x2900,  // Hub Descriptor type
+        0, 8, hub_desc);
+
+    uint8_t num_ports = 0;
+    if (err == ESP_OK) {
+      num_ports = hub_desc[2];
+      ESP_LOGI(TAG, "USB Hub has %d ports", num_ports);
+    } else {
+      ESP_LOGW(TAG, "Get hub descriptor failed: %s, assuming 4 ports",
+               esp_err_to_name(err));
+      num_ports = 4;
+    }
+
+    if (num_ports > 8) num_ports = 8;
+
+    // Power on each port
+    for (int port = 1; port <= num_ports; port++) {
+      err = ctrl_transfer_sync_(
+          dev,
+          USB_BM_REQUEST_TYPE_DIR_OUT | USB_BM_REQUEST_TYPE_TYPE_CLASS |
+              USB_BM_REQUEST_TYPE_RECIP_OTHER,
+          HUB_REQ_SET_FEATURE,
+          HUB_PORT_POWER,
+          port, 0);
+      if (err == ESP_OK) {
+        ESP_LOGD(TAG, "Hub port %d powered on", port);
+      } else {
+        ESP_LOGW(TAG, "Hub port %d power failed: %s", port, esp_err_to_name(err));
+      }
+    }
+
+    // Wait for ports to power up
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    // Check each port for connected devices and reset them
+    for (int port = 1; port <= num_ports; port++) {
+      uint8_t status_buf[4] = {};
+      err = ctrl_transfer_sync_(
+          dev,
+          USB_BM_REQUEST_TYPE_DIR_IN | USB_BM_REQUEST_TYPE_TYPE_CLASS |
+              USB_BM_REQUEST_TYPE_RECIP_OTHER,
+          HUB_REQ_GET_STATUS,
+          0, port, 4, status_buf);
+
+      if (err != ESP_OK) {
+        ESP_LOGD(TAG, "Hub port %d get_status failed", port);
+        continue;
+      }
+
+      uint16_t port_status = status_buf[0] | (status_buf[1] << 8);
+      ESP_LOGD(TAG, "Hub port %d status: 0x%04X", port, port_status);
+
+      if (!(port_status & HUB_PORT_STATUS_CONNECTION)) {
+        ESP_LOGD(TAG, "Hub port %d: no device", port);
+        continue;
+      }
+
+      ESP_LOGI(TAG, "Hub port %d: device connected, resetting...", port);
+
+      // Clear connection change
+      ctrl_transfer_sync_(
+          dev,
+          USB_BM_REQUEST_TYPE_DIR_OUT | USB_BM_REQUEST_TYPE_TYPE_CLASS |
+              USB_BM_REQUEST_TYPE_RECIP_OTHER,
+          HUB_REQ_CLEAR_FEATURE,
+          HUB_C_PORT_CONNECTION,
+          port, 0);
+
+      // Reset the port
+      err = ctrl_transfer_sync_(
+          dev,
+          USB_BM_REQUEST_TYPE_DIR_OUT | USB_BM_REQUEST_TYPE_TYPE_CLASS |
+              USB_BM_REQUEST_TYPE_RECIP_OTHER,
+          HUB_REQ_SET_FEATURE,
+          HUB_PORT_RESET,
+          port, 0);
+
+      if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Hub port %d reset failed: %s", port, esp_err_to_name(err));
+        continue;
+      }
+
+      // Wait for reset to complete
+      vTaskDelay(pdMS_TO_TICKS(100));
+
+      // Clear reset change
+      ctrl_transfer_sync_(
+          dev,
+          USB_BM_REQUEST_TYPE_DIR_OUT | USB_BM_REQUEST_TYPE_TYPE_CLASS |
+              USB_BM_REQUEST_TYPE_RECIP_OTHER,
+          HUB_REQ_CLEAR_FEATURE,
+          HUB_C_PORT_RESET,
+          port, 0);
+
+      // Check port is now enabled
+      err = ctrl_transfer_sync_(
+          dev,
+          USB_BM_REQUEST_TYPE_DIR_IN | USB_BM_REQUEST_TYPE_TYPE_CLASS |
+              USB_BM_REQUEST_TYPE_RECIP_OTHER,
+          HUB_REQ_GET_STATUS,
+          0, port, 4, status_buf);
+
+      if (err == ESP_OK) {
+        port_status = status_buf[0] | (status_buf[1] << 8);
+        ESP_LOGI(TAG, "Hub port %d after reset: status=0x%04X %s%s",
+                 port, port_status,
+                 (port_status & HUB_PORT_STATUS_CONNECTION) ? "CONN " : "",
+                 (port_status & HUB_PORT_STATUS_ENABLE) ? "ENABLE" : "");
+      }
+    }
+
+    return true;
+  }
+
   // ── Detect chip type from device descriptor ───────────────
   ChipType detect_chip_type_(const usb_device_desc_t *desc,
                              const usb_config_desc_t *config_desc) {
-    // FTDI: vendor 0x0403
     if (desc->idVendor == FTDI_VID) {
       ESP_LOGI(TAG, "Detected FTDI chip (PID=%04X)", desc->idProduct);
       return ChipType::FTDI;
     }
 
-    // Check interface class for CDC-ACM
     int offset = 0;
     for (int i = 0; i < config_desc->bNumInterfaces; i++) {
       const usb_intf_desc_t *intf = usb_parse_interface_descriptor(
@@ -156,13 +365,8 @@ class UsbBridgeComponent : public Component {
     return ChipType::GENERIC;
   }
 
-  // ── Try to open any USB serial device ─────────────────────
+  // ── Try to open any USB device ────────────────────────────
   void try_open_device_(uint8_t dev_addr) {
-    if (usb_connected_.load()) {
-      ESP_LOGD(TAG, "Already connected to a device, skipping");
-      return;
-    }
-
     usb_device_handle_t dev;
     esp_err_t err = usb_host_device_open(client_hdl_, dev_addr, &dev);
     if (err != ESP_OK) {
@@ -181,9 +385,25 @@ class UsbBridgeComponent : public Component {
     ESP_LOGI(TAG, "USB device: VID=%04X PID=%04X Class=%02X",
              desc->idVendor, desc->idProduct, desc->bDeviceClass);
 
-    // Skip USB hubs
+    // Handle USB hubs: power on ports and reset to enumerate downstream devices
     if (desc->bDeviceClass == USB_CLASS_HUB) {
-      ESP_LOGD(TAG, "Skipping USB hub");
+      ESP_LOGI(TAG, "Found USB hub, managing ports...");
+      // Claim hub interface
+      err = usb_host_interface_claim(client_hdl_, dev, 0, 0);
+      if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Hub interface claim failed: %s", esp_err_to_name(err));
+        usb_host_device_close(client_hdl_, dev);
+        return;
+      }
+      hub_hdl_ = dev;
+      handle_hub_(dev);
+      // Keep hub open — don't close it, downstream devices need it
+      return;
+    }
+
+    // For non-hub devices: try to use as serial bridge
+    if (usb_connected_.load()) {
+      ESP_LOGD(TAG, "Already connected to a device, skipping");
       usb_host_device_close(client_hdl_, dev);
       return;
     }
@@ -196,17 +416,14 @@ class UsbBridgeComponent : public Component {
       return;
     }
 
-    // Detect chip type
     chip_type_ = detect_chip_type_(desc, config_desc);
 
-    // Find bulk endpoints (scan all interfaces)
     if (!find_bulk_endpoints_(config_desc)) {
       ESP_LOGE(TAG, "No bulk IN/OUT endpoints found");
       usb_host_device_close(client_hdl_, dev);
       return;
     }
 
-    // Claim the interface that has the bulk endpoints
     err = usb_host_interface_claim(client_hdl_, dev, claimed_intf_, 0);
     if (err != ESP_OK) {
       ESP_LOGE(TAG, "interface_claim(%d) failed: %s", claimed_intf_,
@@ -219,11 +436,10 @@ class UsbBridgeComponent : public Component {
     dev_hdl_ = dev;
     xSemaphoreGive(usb_mutex_);
 
-    // Chip-specific initialization
     if (chip_type_ == ChipType::FTDI) {
-      ftdi_init_();
+      ftdi_init_(dev);
     } else if (chip_type_ == ChipType::CDC_ACM) {
-      cdc_set_line_coding_();
+      cdc_set_line_coding_(dev);
     }
 
     usb_connected_.store(true);
@@ -238,7 +454,7 @@ class UsbBridgeComponent : public Component {
                             this, 6, nullptr, 1);
   }
 
-  // ── Find bulk IN and OUT endpoints (all interfaces) ───────
+  // ── Find bulk IN and OUT endpoints ────────────────────────
   bool find_bulk_endpoints_(const usb_config_desc_t *config_desc) {
     bulk_in_ep_ = 0;
     bulk_out_ep_ = 0;
@@ -248,11 +464,7 @@ class UsbBridgeComponent : public Component {
       const usb_intf_desc_t *intf = usb_parse_interface_descriptor(
           config_desc, i, 0, &offset);
       if (!intf) continue;
-
-      // Skip interfaces without endpoints
       if (intf->bNumEndpoints == 0) continue;
-
-      // For CDC-ACM: prefer the data interface (class 0x0A), not the control interface (0x02)
       if (intf->bInterfaceClass == USB_CLASS_CDC && chip_type_ == ChipType::CDC_ACM) continue;
 
       uint8_t in_ep = 0, out_ep = 0;
@@ -286,57 +498,31 @@ class UsbBridgeComponent : public Component {
   }
 
   // ── FTDI initialization ───────────────────────────────────
-  void ftdi_init_() {
-    ftdi_control_(FTDI_REQ_RESET, 0, 0);       // Reset
-    ftdi_control_(FTDI_REQ_RESET, 1, 0);       // Purge RX
-    ftdi_control_(FTDI_REQ_RESET, 2, 0);       // Purge TX
-    uint16_t divisor = 3000000 / baud_rate_;
-    ftdi_control_(FTDI_REQ_SET_BAUDRATE, divisor, 0);
-    ftdi_control_(FTDI_REQ_SET_DATA, 0x0008, 0);   // 8N1
-    ftdi_control_(FTDI_REQ_SET_FLOW_CTRL, 0, 0);   // No flow control
+  void ftdi_init_(usb_device_handle_t dev) {
+    auto vc = [&](uint8_t req, uint16_t val, uint16_t idx) {
+      ctrl_transfer_sync_(dev,
+          USB_BM_REQUEST_TYPE_DIR_OUT | USB_BM_REQUEST_TYPE_TYPE_VENDOR |
+              USB_BM_REQUEST_TYPE_RECIP_DEVICE,
+          req, val, idx, 0);
+    };
+    vc(FTDI_REQ_RESET, 0, 0);
+    vc(FTDI_REQ_RESET, 1, 0);
+    vc(FTDI_REQ_RESET, 2, 0);
+    vc(FTDI_REQ_SET_BAUDRATE, 3000000 / baud_rate_, 0);
+    vc(FTDI_REQ_SET_DATA, 0x0008, 0);
+    vc(FTDI_REQ_SET_FLOW_CTRL, 0, 0);
     ESP_LOGD(TAG, "FTDI configured: %d baud, 8N1", baud_rate_);
   }
 
-  esp_err_t ftdi_control_(uint8_t request, uint16_t value, uint16_t index) {
-    usb_transfer_t *xfer;
-    esp_err_t err = usb_host_transfer_alloc(sizeof(usb_setup_packet_t), 0, &xfer);
-    if (err != ESP_OK) return err;
-
-    xfer->device_handle = dev_hdl_;
-    xfer->bEndpointAddress = 0;
-    xfer->callback = control_xfer_cb_;
-    xfer->context = this;
-    xfer->timeout_ms = 1000;
-
-    usb_setup_packet_t *setup = (usb_setup_packet_t *)xfer->data_buffer;
-    setup->bmRequestType = USB_BM_REQUEST_TYPE_DIR_OUT |
-                           USB_BM_REQUEST_TYPE_TYPE_VENDOR |
-                           USB_BM_REQUEST_TYPE_RECIP_DEVICE;
-    setup->bRequest = request;
-    setup->wValue = value;
-    setup->wIndex = index;
-    setup->wLength = 0;
-    xfer->num_bytes = sizeof(usb_setup_packet_t);
-
-    err = usb_host_transfer_submit_control(client_hdl_, xfer);
-    if (err != ESP_OK) {
-      usb_host_transfer_free(xfer);
-      return err;
-    }
-    vTaskDelay(pdMS_TO_TICKS(50));
-    return ESP_OK;
-  }
-
   // ── CDC-ACM SET_LINE_CODING ───────────────────────────────
-  void cdc_set_line_coding_() {
-    // SET_LINE_CODING: 7 bytes payload (baud, stop, parity, data bits)
+  void cdc_set_line_coding_(usb_device_handle_t dev) {
     usb_transfer_t *xfer;
     esp_err_t err = usb_host_transfer_alloc(sizeof(usb_setup_packet_t) + 7, 0, &xfer);
     if (err != ESP_OK) return;
 
-    xfer->device_handle = dev_hdl_;
+    xfer->device_handle = dev;
     xfer->bEndpointAddress = 0;
-    xfer->callback = control_xfer_cb_;
+    xfer->callback = ctrl_xfer_sync_cb_;
     xfer->context = this;
     xfer->timeout_ms = 1000;
 
@@ -349,27 +535,22 @@ class UsbBridgeComponent : public Component {
     setup->wIndex = 0;
     setup->wLength = 7;
 
-    // Line coding data: baud(4), stop(1), parity(1), databits(1)
     uint8_t *data = xfer->data_buffer + sizeof(usb_setup_packet_t);
     uint32_t baud = static_cast<uint32_t>(baud_rate_);
-    memcpy(data, &baud, 4);  // dwDTERate (little-endian)
-    data[4] = 0;  // bCharFormat: 1 stop bit
-    data[5] = 0;  // bParityType: none
-    data[6] = 8;  // bDataBits: 8
+    memcpy(data, &baud, 4);
+    data[4] = 0;
+    data[5] = 0;
+    data[6] = 8;
     xfer->num_bytes = sizeof(usb_setup_packet_t) + 7;
 
+    xSemaphoreTake(ctrl_xfer_done_, 0);
     err = usb_host_transfer_submit_control(client_hdl_, xfer);
     if (err != ESP_OK) {
       usb_host_transfer_free(xfer);
       return;
     }
-    vTaskDelay(pdMS_TO_TICKS(50));
-    ESP_LOGD(TAG, "CDC-ACM line coding set: %d baud, 8N1", baud_rate_);
-  }
-
-  static void control_xfer_cb_(usb_transfer_t *xfer) {
-    if (xfer->status != USB_TRANSFER_STATUS_COMPLETED) {
-      ESP_LOGW(TAG, "Control transfer status=%d", xfer->status);
+    if (xSemaphoreTake(ctrl_xfer_done_, pdMS_TO_TICKS(2000)) == pdTRUE) {
+      ESP_LOGD(TAG, "CDC-ACM line coding set: %d baud, 8N1", baud_rate_);
     }
     usb_host_transfer_free(xfer);
   }
@@ -382,6 +563,11 @@ class UsbBridgeComponent : public Component {
       usb_host_interface_release(client_hdl_, dev_hdl_, claimed_intf_);
       usb_host_device_close(client_hdl_, dev_hdl_);
       dev_hdl_ = nullptr;
+    }
+    if (hub_hdl_) {
+      usb_host_interface_release(client_hdl_, hub_hdl_, 0);
+      usb_host_device_close(client_hdl_, hub_hdl_);
+      hub_hdl_ = nullptr;
     }
     xSemaphoreGive(usb_mutex_);
     chip_type_ = ChipType::UNKNOWN;
@@ -431,7 +617,6 @@ class UsbBridgeComponent : public Component {
     const uint8_t *data = xfer->data_buffer;
     size_t len = xfer->actual_num_bytes;
 
-    // FTDI: strip 2-byte modem/line status prefix
     if (self->chip_type_ == ChipType::FTDI) {
       if (len <= 2) return;
       data += 2;
