@@ -66,12 +66,9 @@ USB Device ←→ [Bulk IN/OUT] ←→ ESP32-S3 ←→ [TCP:8880] ←→ HA Add-
 - CDC-ACM SET_LINE_CODING implemented manually
 
 ### Hub Support Approach
-- Built-in ESP-IDF hub driver (`CONFIG_USB_HOST_HUBS_SUPPORTED`) proved fundamentally incompatible with our hub hardware (causes `Root port reset failed` loops).
-- We use a custom deferred hub driver:
-  1. The root port enumerates the hub as a normal device.
-  2. Our client detects `USB_CLASS_HUB`, flags it via `pending_hub_addr_`, and closes it.
-  3. The main `loop()` detects the flag, opens the hub, and sends synchronous control transfers to power up and reset the downstream ports.
-  4. Downstream devices then trigger `NEW_DEV` events natively.
+- ESP-IDF built-in hub driver handles hub enumeration (`CONFIG_USB_HOST_HUBS_SUPPORTED` and `MULTI_LEVEL`).
+- Our code skips hub devices (class 0x09) — does not open/claim them, handing them completely to the ESP-IDF hub daemon.
+- Downstream attached devices automatically natively trigger separate `NEW_DEV` events.
 
 ### Socket API
 - Uses `lwip_socket()`, `lwip_send()`, etc. directly
@@ -130,18 +127,16 @@ the base USB OTG option only.
   `usb_host_client_handle_events()`. Control transfer completions also
   delivered through same function → deadlock, all transfers timeout.
 - **Fix**: Defer hub handling via `pending_hub_addr_` flag, process in main `loop()` task.
-- **Current status**: Successfully implemented. Built-in ESP-IDF hub driver was abandoned due to root port reset failures, and this deferred logic is now our primary hub support method.
+- **Current status**: Custom hub driver permanently abandoned. Using ESP-IDF built-in hub driver now that underlying WDT/deadlocks are fixed.
 
 ### 7. Root port reset failed (2026-03-29)
 - **Error**: `E (xxxxx) HUB: Root port reset failed` & `Interrupt wdt timeout on CPU0`
 - **Source**: ESP-IDF's internal HUB component and Client Registration.
-- **Root cause 1 (WDT Crash)**: `usb_host_client_register()` was called twice, leaking a client handle. The leaked client's event queue filled up with `NEW_DEV` events, causing the USB daemon task on CPU0 to spin endlessly and trigger the watchdog timer.
-- **Root cause 2 (Reset Failed)**: After fixing the WDT crash, the built-in ESP-IDF hub driver still consistently failed to reset the root port when dealing with our specific hub hardware (VID=1A40 PID=0201), a known ESP-IDF issue with particular hubs.
+- **Root cause 1 (WDT/Reset Crash)**: `usb_host_client_register()` was called twice, leaking a client handle. The leaked client's event queue filled up with events, causing the USB daemon task to spin endlessly. Crucially, this blocked `event_pending` from clearing, meaning any `hcd_port_command(RESET)` (which ESP-IDF relies on for the hub) was instantly rejected.
+- **Root cause 2 (No NEW_DEV for downstream)**: When abandoning the built-in driver, the ESP-IDF USB Host stack (without `CONFIG_USB_HOST_HUBS_SUPPORTED`) natively ignores downstream devices behind hubs. Returning to the built-in driver was the only way to get downstream `NEW_DEV` events.
 - **Fix**: 
   - Fixed double client registration in `usb_task_()`.
-  - Added `vTaskDelay` error handling to USB tasks to prevent 100% CPU starvation.
-  - **Permanently abandoned** the ESP-IDF built-in hub driver (`CONFIG_USB_HOST_HUBS_SUPPORTED`).
-  - Resurrected the custom `handle_hub_()` user code, resolving its original deadlock by executing it securely from the ESPHome `loop()`.
+  - Re-enabled `CONFIG_USB_HOST_HUBS_SUPPORTED`. The built-in driver now fully functions because the internal event deadlock is gone.
 
 ## Reference Projects
 - **SLZB-MR5U**: ESP32-based, has USB passthrough with device/interface selection
