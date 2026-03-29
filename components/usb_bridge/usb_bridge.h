@@ -339,7 +339,7 @@ class UsbBridgeComponent : public Component {
 
     ESP_LOGI(TAG, "Dumping config desc. TotalLength=%d, NumInterfaces=%d", 
              config_desc->wTotalLength, config_desc->bNumInterfaces);
-    esp_log_buffer_hex(TAG, config_desc, config_desc->wTotalLength > 128 ? 128 : config_desc->wTotalLength);
+    ESP_LOG_BUFFER_HEX(TAG, config_desc, config_desc->wTotalLength > 128 ? 128 : config_desc->wTotalLength);
 
     const uint8_t* p = (const uint8_t*)config_desc;
     const uint8_t* end = p + config_desc->wTotalLength;
