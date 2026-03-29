@@ -29,3 +29,6 @@ async def to_code(config):
     # No external IDF components needed — uses only the built-in USB Host API
     add_idf_sdkconfig_option("CONFIG_USB_OTG_SUPPORTED", True)
     add_idf_sdkconfig_option("CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE", 1024)
+    # Enable external USB hub support (ESP-IDF 5.4+)
+    add_idf_sdkconfig_option("CONFIG_USB_HOST_HUB_MULTI_LEVEL", True)
+    add_idf_sdkconfig_option("CONFIG_USB_HOST_EXT_HUB_MAX_PORTS", 4)
