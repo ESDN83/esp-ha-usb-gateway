@@ -145,13 +145,16 @@ the base USB OTG option only.
   target for Phase 2 web interface design.
 
 ## Phase Plan
-1. **Phase 1** (current): Basic USB-to-TCP bridge working with hub support
-2. **Phase 2**: Web UI with device selection (like SLZB-MR5U)
+1. **Phase 1** (completed): Basic USB-to-TCP bridge working with hub support, native robust ESP-IDF Driver setup.
+2. **Phase 2** (pending): Web UI with device selection.
    - Device dropdown showing all connected USB devices (VID, PID, description)
    - Interface selection for multi-interface devices
-   - Baud rate configuration via UI
-   - Vue 3 SPA like HB-RF-ETH-ng
-3. **Phase 3**: Multiple simultaneous device support (multiple TCP ports)
+3. **Phase 3** (completed): Multi-Device Support & YAML Configuration
+   - ESPHome YAML `devices` array list integration to map multiple instances natively.
+   - Multiple TCP server logic listening dynamically on ports based on array properties.
+   - CP210X (`0x10C4:0xEA60`) and FTDI (`0x0403:0x6001`) configuration (baud rates).
+   - "autoboot" configuration parameter to bypass DTR/RTS assertions on ESP32 boot, cleanly resolving Zigbee dongle reboot loops.
+   - Forceful GPIO 19/20 LOW-level SE0 pulse implemented during early boot sequence to fully flush USB Hub state machines, bypassing `CHECK_SHORT_DEV_DESC` crashes.
 
 ## GitHub
 - **Repo**: https://github.com/ESDN83/esp-ha-usb-gateway
