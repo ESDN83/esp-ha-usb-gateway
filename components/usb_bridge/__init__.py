@@ -26,17 +26,11 @@ async def to_code(config):
     cg.add(var.set_tcp_port(config[CONF_TCP_PORT]))
     cg.add(var.set_baud_rate(config[CONF_BAUD_RATE]))
 
-    # No external IDF components needed — uses only the built-in USB Host API
+    # Bare minimum for USB host on ESP32-S3
     add_idf_sdkconfig_option("CONFIG_USB_OTG_SUPPORTED", True)
     add_idf_sdkconfig_option("CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE", 1024)
 
-    # Hub support (ESP-IDF 5.2+, ESPHome 2026.1 uses IDF 5.5.2)
-    add_idf_sdkconfig_option("CONFIG_USB_HOST_HUBS_SUPPORTED", True)
-    add_idf_sdkconfig_option("CONFIG_USB_HOST_HUB_MULTI_LEVEL", True)
-    add_idf_sdkconfig_option("CONFIG_USB_HOST_EXT_HUB_MAX_PORTS", 4)
-
-    # Increase USB timing for slow-starting hubs (ESP-IDF #10086, #12412)
-    add_idf_sdkconfig_option("CONFIG_USB_HOST_DEBOUNCE_DELAY_MS", 300)
-    add_idf_sdkconfig_option("CONFIG_USB_HOST_RESET_HOLD_MS", 50)
-    add_idf_sdkconfig_option("CONFIG_USB_HOST_RESET_RECOVERY_MS", 50)
-    add_idf_sdkconfig_option("CONFIG_USB_HOST_SET_ADDR_RECOVERY_MS", 20)
+    # PSRAM can cause USB host interrupts to be missed (ESP-IDF #9519).
+    # Disable PSRAM to ensure reliable USB host operation.
+    add_idf_sdkconfig_option("CONFIG_SPIRAM", False)
+    add_idf_sdkconfig_option("CONFIG_ESP32S3_SPIRAM_SUPPORT", False)
