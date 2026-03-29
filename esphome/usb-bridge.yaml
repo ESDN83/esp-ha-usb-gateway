@@ -48,22 +48,7 @@ web_server:
   port: 80
 
 # USB Serial <-> TCP Bridge
-# Config can be changed via web UI at http://<device-ip>:81/
-# Web UI config (saved to NVS) overrides these YAML defaults
+# No YAML device config needed!
+# All device configuration is done via web UI at http://<device-ip>:81/
+# Detected USB devices are shown automatically, assign them to TCP ports in the UI.
 usb_bridge:
-  devices:
-    - name: "SkyConnect ZHA"
-      vid: "10C4"
-      pid: "EA60"
-      port: 8880
-      baud_rate: 115200
-      interface: 0
-      autoboot: true
-
-    - name: "EnOcean USB 300"
-      vid: "0403"
-      pid: "6001"
-      port: 8881
-      baud_rate: 57600
-      interface: 0
-      autoboot: false
