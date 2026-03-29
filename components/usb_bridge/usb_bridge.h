@@ -388,19 +388,12 @@ class UsbBridgeComponent : public Component {
     ESP_LOGI(TAG, "USB device: VID=%04X PID=%04X Class=%02X",
              desc->idVendor, desc->idProduct, desc->bDeviceClass);
 
-    // Handle USB hubs: defer port management to main task loop (cannot do
-    // control transfers inside event callback — they need the same event
-    // processing thread to complete, causing a deadlock)
+    // Skip USB hubs — the built-in ESP-IDF hub driver handles enumeration
+    // of downstream devices. They will appear as separate NEW_DEV events.
     if (desc->bDeviceClass == USB_CLASS_HUB) {
-      ESP_LOGI(TAG, "Found USB hub, deferring port management...");
-      err = usb_host_interface_claim(client_hdl_, dev, 0, 0);
-      if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Hub interface claim failed: %s", esp_err_to_name(err));
-        usb_host_device_close(client_hdl_, dev);
-        return;
-      }
-      hub_hdl_ = dev;
-      pending_hub_addr_.store(dev_addr);
+      ESP_LOGI(TAG, "USB hub detected (VID=%04X PID=%04X), letting built-in driver handle it",
+               desc->idVendor, desc->idProduct);
+      usb_host_device_close(client_hdl_, dev);
       return;
     }
 
@@ -656,15 +649,7 @@ class UsbBridgeComponent : public Component {
     ESP_LOGI(TAG, "USB host client registered, waiting for device...");
 
     while (true) {
-      usb_host_client_handle_events(client_hdl_, pdMS_TO_TICKS(100));
-
-      // Process deferred hub management outside the event callback
-      uint8_t hub_addr = pending_hub_addr_.load();
-      if (hub_addr != 0 && hub_hdl_) {
-        pending_hub_addr_.store(0);
-        ESP_LOGI(TAG, "Processing deferred hub port management...");
-        handle_hub_(hub_hdl_);
-      }
+      usb_host_client_handle_events(client_hdl_, pdMS_TO_TICKS(1000));
     }
   }
 
