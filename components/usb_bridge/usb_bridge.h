@@ -173,11 +173,11 @@ class UsbBridgeComponent : public Component {
                               conn, 5, nullptr, 1);
     }
 
-    // Start config web UI on port 81
+    // Start config web UI on port 80
     web_ctx_.component = this;
-    web_ctx_.server = start_config_webserver_(81);
+    web_ctx_.server = start_config_webserver_(80);
 
-    ESP_LOGI(TAG, "USB TCP Gateway ready — config UI at http://<ip>:81/");
+    ESP_LOGI(TAG, "USB TCP Gateway ready — config UI at http://<ip>/");
   }
 
   void loop() override {}
