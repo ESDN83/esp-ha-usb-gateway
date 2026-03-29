@@ -90,7 +90,7 @@ class UsbBridgeComponent : public Component {
       return;
     }
 
-    xTaskCreatePinnedToCore(usb_lib_task_, "usb_lib", 4096,
+    xTaskCreatePinnedToCore(usb_lib_task_, "usb_lib", 8192,
                             nullptr, 10, nullptr, 0);
     xTaskCreatePinnedToCore(usb_task_entry_, "usb_mon", 8192,
                             this, 5, nullptr, 1);
