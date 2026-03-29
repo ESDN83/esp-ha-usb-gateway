@@ -47,6 +47,7 @@ async def to_code(config):
 
     for dev in config[CONF_DEVICES]:
         cg.add(var.add_device_config(
+            dev[CONF_NAME],
             dev[CONF_VID],
             dev[CONF_PID],
             dev[CONF_PORT],
@@ -55,9 +56,12 @@ async def to_code(config):
             dev[CONF_AUTOBOOT]
         ))
 
-    # Bare minimum for USB host on ESP32-S3
+    # USB host on ESP32-S3
     add_idf_sdkconfig_option("CONFIG_USB_OTG_SUPPORTED", True)
     add_idf_sdkconfig_option("CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE", 1024)
+
+    # HTTP server for config web UI (port 81)
+    add_idf_sdkconfig_option("CONFIG_HTTPD_MAX_REQ_HDR_LEN", 1024)
 
     # Enable native hub support
     add_idf_sdkconfig_option("CONFIG_USB_HOST_HUBS_SUPPORTED", True)

@@ -13,10 +13,13 @@
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 #include "esp_netif.h"
+#include "esp_system.h"
 
 #include <atomic>
 #include <cstring>
 #include <vector>
+
+#include "web_ui.h"
 
 namespace esphome {
 namespace usb_bridge {
@@ -60,6 +63,7 @@ struct DeviceConfig {
   int baud_rate;
   uint8_t interface;
   bool autoboot;
+  char name[32];
 };
 
 class UsbBridgeComponent; // forward declare
@@ -83,13 +87,22 @@ struct DeviceConnection {
 
 class UsbBridgeComponent : public Component {
  public:
-  void add_device_config(uint16_t vid, uint16_t pid, int port, int baud_rate, uint8_t interface, bool autoboot) {
+  void add_device_config(const std::string &name, uint16_t vid, uint16_t pid, int port, int baud_rate, uint8_t interface, bool autoboot) {
     DeviceConnection *conn = new DeviceConnection();
-    conn->config = {vid, pid, port, baud_rate, interface, autoboot};
+    conn->config.vid = vid;
+    conn->config.pid = pid;
+    conn->config.port = port;
+    conn->config.baud_rate = baud_rate;
+    conn->config.interface = interface;
+    conn->config.autoboot = autoboot;
+    strncpy(conn->config.name, name.c_str(), sizeof(conn->config.name) - 1);
+    conn->config.name[sizeof(conn->config.name) - 1] = 0;
     conn->parent = this;
     conn->usb_mutex = xSemaphoreCreateMutex();
     connections_.push_back(conn);
   }
+
+  std::vector<DeviceConnection*>& get_connections() { return connections_; }
 
   float get_setup_priority() const override {
     return setup_priority::AFTER_WIFI;
@@ -156,18 +169,63 @@ class UsbBridgeComponent : public Component {
     xTaskCreatePinnedToCore(usb_task_entry_, "usb_mon", 8192,
                             this, 5, nullptr, 1);
 
+    // Load NVS config — overrides YAML defaults if present
+    load_nvs_config_();
+
     // Launch TCP servers for all configs
     for (auto *conn : connections_) {
       xTaskCreatePinnedToCore(tcp_task_entry_, "tcp_srv", 8192,
                               conn, 5, nullptr, 1);
     }
 
+    // Start config web UI on port 81
+    web_ctx_.component = this;
+    web_ctx_.server = start_config_webserver_(81);
+
     ESP_LOGI(TAG, "USB TCP Gateway fully constructed");
   }
 
   void loop() override {}
 
+  // Save current config to NVS and reboot
+  bool save_and_reboot(const std::vector<StoredDeviceConfig> &devs) {
+    if (nvs_save_devices(devs)) {
+      ESP_LOGI(TAG, "Config saved, rebooting in 1s...");
+      vTaskDelay(pdMS_TO_TICKS(1000));
+      esp_restart();
+      return true;
+    }
+    return false;
+  }
+
  private:
+  void load_nvs_config_() {
+    std::vector<StoredDeviceConfig> stored;
+    if (!nvs_load_devices(stored)) {
+      ESP_LOGI(TAG, "No NVS config found, using YAML defaults");
+      return;
+    }
+
+    ESP_LOGI(TAG, "Loading %zu device configs from NVS (overriding YAML)", stored.size());
+
+    // Clear YAML-defined connections
+    for (auto *conn : connections_) {
+      delete conn;
+    }
+    connections_.clear();
+
+    // Rebuild from NVS
+    for (auto &s : stored) {
+      DeviceConnection *conn = new DeviceConnection();
+      conn->config = {s.vid, s.pid, s.port, (int)s.baud_rate, s.interface, (bool)s.autoboot};
+      conn->parent = this;
+      conn->usb_mutex = xSemaphoreCreateMutex();
+      connections_.push_back(conn);
+      ESP_LOGI(TAG, "  NVS device: %s VID=%04X PID=%04X port=%d baud=%d",
+               s.name, s.vid, s.pid, s.port, s.baud_rate);
+    }
+  }
+
   static UsbBridgeComponent *instance_;
 
   std::vector<DeviceConnection*> connections_;
@@ -775,6 +833,169 @@ class UsbBridgeComponent : public Component {
 };
 
 UsbBridgeComponent *UsbBridgeComponent::instance_ = nullptr;
+
+// ── HTTP Handler Implementations (need UsbBridgeComponent) ──
+
+static esp_err_t handle_get_config_(httpd_req_t *req) {
+  auto *comp = web_ctx_.component;
+  if (!comp) {
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No component");
+    return ESP_FAIL;
+  }
+
+  auto &conns = comp->get_connections();
+  // Build JSON array
+  char buf[2048];
+  char *p = buf;
+  const char *end = buf + sizeof(buf) - 2;
+  *p++ = '[';
+
+  for (size_t i = 0; i < conns.size() && p < end - 200; i++) {
+    auto &cfg = conns[i]->config;
+    if (i > 0) *p++ = ',';
+    *p++ = '{';
+    json_append_str(p, end, "name", cfg.name);
+
+    // VID/PID as hex strings
+    char hex[8];
+    snprintf(hex, sizeof(hex), "%04X", cfg.vid);
+    json_append_int(p, end, "vid", cfg.vid);
+    snprintf(hex, sizeof(hex), "%04X", cfg.pid);
+    json_append_int(p, end, "pid", cfg.pid);
+    json_append_int(p, end, "port", cfg.port);
+    json_append_int(p, end, "baud_rate", cfg.baud_rate);
+    json_append_int(p, end, "interface", cfg.interface);
+    json_append_bool(p, end, "autoboot", cfg.autoboot, false);
+    *p++ = '}';
+  }
+  *p++ = ']';
+  *p = 0;
+
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_send(req, buf, p - buf);
+  return ESP_OK;
+}
+
+static esp_err_t handle_get_status_(httpd_req_t *req) {
+  auto *comp = web_ctx_.component;
+  if (!comp) {
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No component");
+    return ESP_FAIL;
+  }
+
+  auto &conns = comp->get_connections();
+  char buf[512];
+  char *p = buf;
+  const char *end = buf + sizeof(buf) - 2;
+  *p++ = '[';
+
+  for (size_t i = 0; i < conns.size() && p < end - 50; i++) {
+    if (i > 0) *p++ = ',';
+    *p++ = '{';
+    json_append_bool(p, end, "connected", conns[i]->connected.load());
+    json_append_int(p, end, "port", conns[i]->config.port, false);
+    *p++ = '}';
+  }
+  *p++ = ']';
+  *p = 0;
+
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_send(req, buf, p - buf);
+  return ESP_OK;
+}
+
+static esp_err_t handle_post_config_(httpd_req_t *req) {
+  auto *comp = web_ctx_.component;
+  if (!comp) {
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No component");
+    return ESP_FAIL;
+  }
+
+  // Read POST body
+  int total_len = req->content_len;
+  if (total_len > 4096) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Too large");
+    return ESP_FAIL;
+  }
+
+  char *body = (char *)malloc(total_len + 1);
+  if (!body) {
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+    return ESP_FAIL;
+  }
+
+  int received = 0;
+  while (received < total_len) {
+    int ret = httpd_req_recv(req, body + received, total_len - received);
+    if (ret <= 0) {
+      free(body);
+      httpd_resp_send_err(req, HTTPD_408_REQ_TIMEOUT, "Timeout");
+      return ESP_FAIL;
+    }
+    received += ret;
+  }
+  body[total_len] = 0;
+
+  // Parse JSON array of device configs
+  // Simple parser: find each {...} object
+  std::vector<StoredDeviceConfig> devs;
+  const char *ptr = body;
+
+  while (*ptr) {
+    const char *obj_start = strchr(ptr, '{');
+    if (!obj_start) break;
+    const char *obj_end = strchr(obj_start, '}');
+    if (!obj_end) break;
+
+    // Extract object substring
+    char obj[512];
+    size_t obj_len = obj_end - obj_start + 1;
+    if (obj_len >= sizeof(obj)) obj_len = sizeof(obj) - 1;
+    memcpy(obj, obj_start, obj_len);
+    obj[obj_len] = 0;
+
+    StoredDeviceConfig cfg = {};
+    json_get_str(obj, "name", cfg.name, sizeof(cfg.name));
+    cfg.vid = json_get_int(obj, "vid", 0);
+    cfg.pid = json_get_int(obj, "pid", 0);
+    cfg.port = json_get_int(obj, "port", 8880);
+    cfg.baud_rate = json_get_int(obj, "baud_rate", 115200);
+    cfg.interface = json_get_int(obj, "interface", 0);
+    cfg.autoboot = json_get_bool(obj, "autoboot", false) ? 1 : 0;
+
+    if (cfg.vid > 0 && cfg.pid > 0 && cfg.port > 0) {
+      devs.push_back(cfg);
+      ESP_LOGI(WEB_TAG, "Parsed device: %s VID=%04X PID=%04X port=%d",
+               cfg.name, cfg.vid, cfg.pid, cfg.port);
+    }
+
+    ptr = obj_end + 1;
+  }
+
+  free(body);
+
+  if (devs.empty()) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No valid devices");
+    return ESP_FAIL;
+  }
+
+  // Save to NVS
+  if (!nvs_save_devices(devs)) {
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "NVS save failed");
+    return ESP_FAIL;
+  }
+
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_sendstr(req, "{\"message\":\"Config saved! Rebooting...\",\"ok\":true}");
+
+  // Reboot after response is sent
+  xTaskCreate([](void *) {
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    esp_restart();
+  }, "reboot", 2048, nullptr, 1, nullptr);
+
+  return ESP_OK;
+}
 
 }  // namespace usb_bridge
 }  // namespace esphome
