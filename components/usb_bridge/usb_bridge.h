@@ -349,8 +349,11 @@ class UsbBridgeComponent : public Component {
       uint16_t in_mps = 64;
 
       for (int j = 0; j < intf->bNumEndpoints; j++) {
+        // We MUST pass nullptr for offset here. The `intf` pointer is already the correct base address.
+        // If we passed the `offset` from `usb_parse_interface_descriptor`, it would apply an offset 
+        // relative to config_desc on top of intf, resulting in scanning garbage memory!
         const usb_ep_desc_t *ep = usb_parse_endpoint_descriptor_by_index(
-            intf, j, config_desc->wTotalLength, &offset);
+            intf, j, config_desc->wTotalLength, nullptr);
         if (!ep) continue;
         if ((ep->bmAttributes & USB_BM_ATTRIBUTES_XFERTYPE_MASK) == USB_BM_ATTRIBUTES_XFER_BULK) {
           if (ep->bEndpointAddress & 0x80) {
