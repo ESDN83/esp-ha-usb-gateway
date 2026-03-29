@@ -131,11 +131,17 @@ class UsbBridgeComponent : public Component {
   // ── USB Host Library daemon ───────────────────────────────
   static void usb_lib_task_(void *arg) {
     while (true) {
-      uint32_t event_flags;
-      usb_host_lib_handle_events(portMAX_DELAY, &event_flags);
-      // Don't call usb_host_device_free_all() — we never deregister our
-      // client, and freeing devices during enumeration disrupts the hub
-      // driver (sets event_pending → root port reset rejected).
+      uint32_t event_flags = 0;
+      esp_err_t err = usb_host_lib_handle_events(portMAX_DELAY, &event_flags);
+      if (err != ESP_OK) {
+        ESP_LOGE(TAG, "lib_handle_events failed: %d (%s)", err, esp_err_to_name(err));
+        vTaskDelay(pdMS_TO_TICKS(100));
+      } else {
+        if (event_flags & USB_HOST_LIB_EVENT_FLAGS_NO_CLIENTS) {
+          ESP_LOGI(TAG, "All clients deregistered, freeing devices...");
+          usb_host_device_free_all();
+        }
+      }
     }
   }
 
@@ -507,25 +513,14 @@ class UsbBridgeComponent : public Component {
   }
 
   void usb_task_() {
-    const usb_host_client_config_t client_config = {
-        .is_synchronous = false,
-        .max_num_event_msg = 5,
-        .async = {
-            .client_event_callback = client_event_cb_,
-            .callback_arg = this,
-        },
-    };
-    esp_err_t err = usb_host_client_register(&client_config, &client_hdl_);
-    if (err != ESP_OK) {
-      ESP_LOGE(TAG, "Client register failed: %s", esp_err_to_name(err));
-      vTaskDelete(nullptr);
-      return;
-    }
-
-    ESP_LOGI(TAG, "USB host client registered, waiting for device...");
+    ESP_LOGI(TAG, "USB client mon task started, waiting for events...");
 
     while (true) {
-      usb_host_client_handle_events(client_hdl_, pdMS_TO_TICKS(1000));
+      esp_err_t err = usb_host_client_handle_events(client_hdl_, pdMS_TO_TICKS(1000));
+      if (err != ESP_OK && err != ESP_ERR_TIMEOUT) {
+        ESP_LOGE(TAG, "client_handle_events failed: %d (%s)", err, esp_err_to_name(err));
+        vTaskDelay(pdMS_TO_TICKS(100));
+      }
     }
   }
 
