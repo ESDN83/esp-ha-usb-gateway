@@ -33,11 +33,10 @@ static constexpr uint8_t FTDI_REQ_SET_DATA = 0x04;
 // CDC-ACM class requests
 static constexpr uint8_t CDC_SET_LINE_CODING = 0x20;
 
-// USB class codes
-static constexpr uint8_t USB_CLASS_CDC = 0x02;
-static constexpr uint8_t USB_CLASS_CDC_DATA = 0x0A;
-static constexpr uint8_t USB_CLASS_VENDOR = 0xFF;
-static constexpr uint8_t USB_CLASS_HUB = 0x09;
+// USB class codes (use ESP-IDF macros where available, define missing ones)
+#ifndef USB_CLASS_CDC
+#define USB_CLASS_CDC 0x02
+#endif
 
 enum class ChipType : uint8_t {
   UNKNOWN = 0,
