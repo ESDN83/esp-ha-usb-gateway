@@ -30,6 +30,13 @@ async def to_code(config):
     add_idf_sdkconfig_option("CONFIG_USB_OTG_SUPPORTED", True)
     add_idf_sdkconfig_option("CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE", 1024)
 
+    # Enable native hub support (trying both known variants for different ESP-IDF versions)
+    add_idf_sdkconfig_option("CONFIG_USB_HOST_HUBS_SUPPORTED", True)
+    add_idf_sdkconfig_option("CONFIG_USB_HOST_HUB_MULTI_LEVEL", True)
+    add_idf_sdkconfig_option("CONFIG_USB_HOST_DEBOUNCE_DELAY_MS", 500)
+    add_idf_sdkconfig_option("CONFIG_USB_HOST_RESET_HOLD_MS", 100)
+    add_idf_sdkconfig_option("CONFIG_USB_HOST_RESET_RECOVERY_MS", 300)
+
     # PSRAM can cause USB host interrupts to be missed (ESP-IDF #9519).
     # Disable PSRAM to ensure reliable USB host operation.
     add_idf_sdkconfig_option("CONFIG_SPIRAM", False)
