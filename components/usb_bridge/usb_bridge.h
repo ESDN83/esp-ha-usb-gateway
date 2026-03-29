@@ -337,41 +337,53 @@ class UsbBridgeComponent : public Component {
     bulk_in_ep_ = 0;
     bulk_out_ep_ = 0;
 
-    for (int i = 0; i < config_desc->bNumInterfaces; i++) {
-      int offset = 0;
-      const usb_intf_desc_t *intf = usb_parse_interface_descriptor(
-          config_desc, i, 0, &offset);
-      if (!intf) continue;
-      if (intf->bNumEndpoints == 0) continue;
-      if (intf->bInterfaceClass == USB_CLASS_CDC && chip_type_ == ChipType::CDC_ACM) continue;
+    const uint8_t* p = (const uint8_t*)config_desc;
+    const uint8_t* end = p + config_desc->wTotalLength;
 
-      uint8_t in_ep = 0, out_ep = 0;
-      uint16_t in_mps = 64;
+    uint8_t current_intf = 0;
+    uint8_t intf_class = 0;
+    uint8_t in_ep[32] = {};
+    uint8_t out_ep[32] = {};
+    uint16_t in_mps[32] = {};
+    bool skip_intf[32] = {};
 
-      for (int j = 0; j < intf->bNumEndpoints; j++) {
-        // We MUST pass nullptr for offset here. The `intf` pointer is already the correct base address.
-        // If we passed the `offset` from `usb_parse_interface_descriptor`, it would apply an offset 
-        // relative to config_desc on top of intf, resulting in scanning garbage memory!
-        const usb_ep_desc_t *ep = usb_parse_endpoint_descriptor_by_index(
-            intf, j, config_desc->wTotalLength, nullptr);
-        if (!ep) continue;
-        if ((ep->bmAttributes & USB_BM_ATTRIBUTES_XFERTYPE_MASK) == USB_BM_ATTRIBUTES_XFER_BULK) {
-          if (ep->bEndpointAddress & 0x80) {
-            in_ep = ep->bEndpointAddress;
-            in_mps = ep->wMaxPacketSize;
-          } else {
-            out_ep = ep->bEndpointAddress;
+    while (p < end && p[0] >= 2) {
+      uint8_t len = p[0];
+      uint8_t type = p[1];
+
+      if (type == USB_B_DESCRIPTOR_TYPE_INTERFACE) {
+        const usb_intf_desc_t* intf = (const usb_intf_desc_t*)p;
+        current_intf = intf->bInterfaceNumber;
+        if (current_intf < 32) {
+          intf_class = intf->bInterfaceClass;
+          // Skip CDC control interface if we are CDC_ACM (it doesn't have the bulk endpoints)
+          if (intf_class == USB_CLASS_CDC && chip_type_ == ChipType::CDC_ACM) {
+            skip_intf[current_intf] = true;
+          }
+        }
+      } else if (type == USB_B_DESCRIPTOR_TYPE_ENDPOINT) {
+        if (current_intf < 32 && !skip_intf[current_intf]) {
+          const usb_ep_desc_t* ep = (const usb_ep_desc_t*)p;
+          if ((ep->bmAttributes & USB_BM_ATTRIBUTES_XFERTYPE_MASK) == USB_BM_ATTRIBUTES_XFER_BULK) {
+            if (ep->bEndpointAddress & 0x80) {
+              in_ep[current_intf] = ep->bEndpointAddress;
+              in_mps[current_intf] = ep->wMaxPacketSize;
+            } else {
+              out_ep[current_intf] = ep->bEndpointAddress;
+            }
           }
         }
       }
+      p += len;
+    }
 
-      if (in_ep && out_ep) {
-        bulk_in_ep_ = in_ep;
-        bulk_out_ep_ = out_ep;
-        bulk_in_mps_ = in_mps;
-        claimed_intf_ = intf->bInterfaceNumber;
-        ESP_LOGD(TAG, "Found bulk endpoints on interface %d: IN=0x%02X (MPS=%d) OUT=0x%02X",
-                 claimed_intf_, in_ep, in_mps, out_ep);
+    for (int i = 0; i < 32; i++) {
+      if (in_ep[i] != 0 && out_ep[i] != 0) {
+        bulk_in_ep_ = in_ep[i];
+        bulk_out_ep_ = out_ep[i];
+        bulk_in_mps_ = in_mps[i];
+        claimed_intf_ = i;
+        ESP_LOGI(TAG, "Found bulk endpoints on interface %d. IN=0x%02X OUT=0x%02X", i, bulk_in_ep_, bulk_out_ep_);
         return true;
       }
     }
