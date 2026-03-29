@@ -29,6 +29,14 @@ async def to_code(config):
     # No external IDF components needed — uses only the built-in USB Host API
     add_idf_sdkconfig_option("CONFIG_USB_OTG_SUPPORTED", True)
     add_idf_sdkconfig_option("CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE", 1024)
-    # Hub support — silently ignored if IDF version < 5.4
+
+    # Hub support (ESP-IDF 5.2+, ESPHome 2026.1 uses IDF 5.5.2)
+    add_idf_sdkconfig_option("CONFIG_USB_HOST_HUBS_SUPPORTED", True)
     add_idf_sdkconfig_option("CONFIG_USB_HOST_HUB_MULTI_LEVEL", True)
     add_idf_sdkconfig_option("CONFIG_USB_HOST_EXT_HUB_MAX_PORTS", 4)
+
+    # Increase USB timing for slow-starting hubs (ESP-IDF #10086, #12412)
+    add_idf_sdkconfig_option("CONFIG_USB_HOST_DEBOUNCE_DELAY_MS", 300)
+    add_idf_sdkconfig_option("CONFIG_USB_HOST_RESET_HOLD_MS", 50)
+    add_idf_sdkconfig_option("CONFIG_USB_HOST_RESET_RECOVERY_MS", 50)
+    add_idf_sdkconfig_option("CONFIG_USB_HOST_SET_ADDR_RECOVERY_MS", 20)
