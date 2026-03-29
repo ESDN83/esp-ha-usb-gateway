@@ -337,6 +337,10 @@ class UsbBridgeComponent : public Component {
     bulk_in_ep_ = 0;
     bulk_out_ep_ = 0;
 
+    ESP_LOGI(TAG, "Dumping config desc. TotalLength=%d, NumInterfaces=%d", 
+             config_desc->wTotalLength, config_desc->bNumInterfaces);
+    esp_log_buffer_hex(TAG, config_desc, config_desc->wTotalLength > 128 ? 128 : config_desc->wTotalLength);
+
     const uint8_t* p = (const uint8_t*)config_desc;
     const uint8_t* end = p + config_desc->wTotalLength;
 
@@ -362,17 +366,22 @@ class UsbBridgeComponent : public Component {
           }
         }
       } else if (type == USB_B_DESCRIPTOR_TYPE_ENDPOINT) {
+        ESP_LOGI(TAG, "  Endpoint desc: len=%d, addr=0x%02X, attr=0x%02X, MPS=%d", len, p[2], p[3], p[4] | (p[5] << 8));
         if (current_intf < 32 && !skip_intf[current_intf]) {
           const usb_ep_desc_t* ep = (const usb_ep_desc_t*)p;
           if ((ep->bmAttributes & USB_BM_ATTRIBUTES_XFERTYPE_MASK) == USB_BM_ATTRIBUTES_XFER_BULK) {
             if (ep->bEndpointAddress & 0x80) {
               in_ep[current_intf] = ep->bEndpointAddress;
               in_mps[current_intf] = ep->wMaxPacketSize;
+              ESP_LOGI(TAG, "    -> Assigned to IN");
             } else {
               out_ep[current_intf] = ep->bEndpointAddress;
+              ESP_LOGI(TAG, "    -> Assigned to OUT");
             }
           }
         }
+      } else {
+        ESP_LOGI(TAG, "  Ignored desc type=%d len=%d", type, len);
       }
       p += len;
     }
