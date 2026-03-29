@@ -21,21 +21,30 @@ namespace usb_bridge {
 
 static const char *const TAG = "usb_bridge";
 
-// FTDI USB protocol constants
+// Known USB serial chip vendors
 static constexpr uint16_t FTDI_VID = 0x0403;
-static constexpr uint16_t FTDI_PID_FT232 = 0x6001;
 
 // FTDI vendor requests (bmRequestType = 0x40 host-to-device, vendor)
 static constexpr uint8_t FTDI_REQ_RESET = 0x00;
+static constexpr uint8_t FTDI_REQ_SET_FLOW_CTRL = 0x02;
 static constexpr uint8_t FTDI_REQ_SET_BAUDRATE = 0x03;
 static constexpr uint8_t FTDI_REQ_SET_DATA = 0x04;
-static constexpr uint8_t FTDI_REQ_SET_FLOW_CTRL = 0x02;
 
-// FTDI data format: 8N1
-static constexpr uint16_t FTDI_DATA_8N1 = 0x0008;
+// CDC-ACM class requests
+static constexpr uint8_t CDC_SET_LINE_CODING = 0x20;
 
-// FTDI status bytes: first 2 bytes of every bulk read are modem/line status
-static constexpr size_t FTDI_STATUS_BYTES = 2;
+// USB class codes
+static constexpr uint8_t USB_CLASS_CDC = 0x02;
+static constexpr uint8_t USB_CLASS_CDC_DATA = 0x0A;
+static constexpr uint8_t USB_CLASS_VENDOR = 0xFF;
+static constexpr uint8_t USB_CLASS_HUB = 0x09;
+
+enum class ChipType : uint8_t {
+  UNKNOWN = 0,
+  FTDI,      // FT232, FT231 etc. — vendor-specific, 2-byte status prefix
+  CDC_ACM,   // Standard CDC-ACM (e.g. Arduino, some CP210x, CH340 in CDC mode)
+  GENERIC,   // Has bulk endpoints but unknown protocol
+};
 
 class UsbBridgeComponent : public Component {
  public:
@@ -63,15 +72,10 @@ class UsbBridgeComponent : public Component {
       return;
     }
 
-    // USB Host library daemon task
     xTaskCreatePinnedToCore(usb_lib_task_, "usb_lib", 4096,
                             nullptr, 10, nullptr, 0);
-
-    // USB device monitor task
     xTaskCreatePinnedToCore(usb_task_entry_, "usb_mon", 4096,
                             this, 5, nullptr, 1);
-
-    // TCP server task
     xTaskCreatePinnedToCore(tcp_task_entry_, "tcp_srv", 8192,
                             this, 5, nullptr, 1);
 
@@ -91,6 +95,8 @@ class UsbBridgeComponent : public Component {
   uint8_t bulk_in_ep_{0};
   uint8_t bulk_out_ep_{0};
   uint16_t bulk_in_mps_{64};
+  uint8_t claimed_intf_{0};
+  ChipType chip_type_{ChipType::UNKNOWN};
 
   std::atomic<bool> usb_connected_{false};
   std::atomic<int> tcp_client_fd_{-1};
@@ -114,7 +120,7 @@ class UsbBridgeComponent : public Component {
     switch (event_msg->event) {
       case USB_HOST_CLIENT_EVENT_NEW_DEV:
         ESP_LOGI(TAG, "New USB device (addr=%d)", event_msg->new_dev.address);
-        self->try_open_ftdi_(event_msg->new_dev.address);
+        self->try_open_device_(event_msg->new_dev.address);
         break;
       case USB_HOST_CLIENT_EVENT_DEV_GONE:
         ESP_LOGW(TAG, "USB device removed");
@@ -125,8 +131,39 @@ class UsbBridgeComponent : public Component {
     }
   }
 
-  // ── Try to open an FTDI device at given address ───────────
-  void try_open_ftdi_(uint8_t dev_addr) {
+  // ── Detect chip type from device descriptor ───────────────
+  ChipType detect_chip_type_(const usb_device_desc_t *desc,
+                             const usb_config_desc_t *config_desc) {
+    // FTDI: vendor 0x0403
+    if (desc->idVendor == FTDI_VID) {
+      ESP_LOGI(TAG, "Detected FTDI chip (PID=%04X)", desc->idProduct);
+      return ChipType::FTDI;
+    }
+
+    // Check interface class for CDC-ACM
+    int offset = 0;
+    for (int i = 0; i < config_desc->bNumInterfaces; i++) {
+      const usb_intf_desc_t *intf = usb_parse_interface_descriptor(
+          config_desc, i, 0, &offset);
+      if (!intf) continue;
+      if (intf->bInterfaceClass == USB_CLASS_CDC ||
+          intf->bInterfaceClass == USB_CLASS_CDC_DATA) {
+        ESP_LOGI(TAG, "Detected CDC-ACM device");
+        return ChipType::CDC_ACM;
+      }
+    }
+
+    ESP_LOGI(TAG, "Unknown USB serial device, using generic mode");
+    return ChipType::GENERIC;
+  }
+
+  // ── Try to open any USB serial device ─────────────────────
+  void try_open_device_(uint8_t dev_addr) {
+    if (usb_connected_.load()) {
+      ESP_LOGD(TAG, "Already connected to a device, skipping");
+      return;
+    }
+
     usb_device_handle_t dev;
     esp_err_t err = usb_host_device_open(client_hdl_, dev_addr, &dev);
     if (err != ESP_OK) {
@@ -134,19 +171,24 @@ class UsbBridgeComponent : public Component {
       return;
     }
 
-    // Check device descriptor for FTDI VID:PID
     const usb_device_desc_t *desc;
     err = usb_host_get_device_descriptor(dev, &desc);
-    if (err != ESP_OK || desc->idVendor != FTDI_VID || desc->idProduct != FTDI_PID_FT232) {
-      ESP_LOGD(TAG, "Not FTDI FT232 (VID=%04X PID=%04X), skipping",
-               desc ? desc->idVendor : 0, desc ? desc->idProduct : 0);
+    if (err != ESP_OK) {
+      ESP_LOGE(TAG, "get_device_desc failed: %s", esp_err_to_name(err));
       usb_host_device_close(client_hdl_, dev);
       return;
     }
 
-    ESP_LOGI(TAG, "Found FTDI FT232 (VID=%04X PID=%04X)", desc->idVendor, desc->idProduct);
+    ESP_LOGI(TAG, "USB device: VID=%04X PID=%04X Class=%02X",
+             desc->idVendor, desc->idProduct, desc->bDeviceClass);
 
-    // Get config descriptor to find bulk endpoints
+    // Skip USB hubs
+    if (desc->bDeviceClass == USB_CLASS_HUB) {
+      ESP_LOGD(TAG, "Skipping USB hub");
+      usb_host_device_close(client_hdl_, dev);
+      return;
+    }
+
     const usb_config_desc_t *config_desc;
     err = usb_host_get_active_config_descriptor(dev, &config_desc);
     if (err != ESP_OK) {
@@ -155,17 +197,21 @@ class UsbBridgeComponent : public Component {
       return;
     }
 
-    // Parse endpoints from interface 0
+    // Detect chip type
+    chip_type_ = detect_chip_type_(desc, config_desc);
+
+    // Find bulk endpoints (scan all interfaces)
     if (!find_bulk_endpoints_(config_desc)) {
-      ESP_LOGE(TAG, "Could not find bulk IN/OUT endpoints");
+      ESP_LOGE(TAG, "No bulk IN/OUT endpoints found");
       usb_host_device_close(client_hdl_, dev);
       return;
     }
 
-    // Claim interface 0
-    err = usb_host_interface_claim(client_hdl_, dev, 0, 0);
+    // Claim the interface that has the bulk endpoints
+    err = usb_host_interface_claim(client_hdl_, dev, claimed_intf_, 0);
     if (err != ESP_OK) {
-      ESP_LOGE(TAG, "interface_claim failed: %s", esp_err_to_name(err));
+      ESP_LOGE(TAG, "interface_claim(%d) failed: %s", claimed_intf_,
+               esp_err_to_name(err));
       usb_host_device_close(client_hdl_, dev);
       return;
     }
@@ -174,67 +220,95 @@ class UsbBridgeComponent : public Component {
     dev_hdl_ = dev;
     xSemaphoreGive(usb_mutex_);
 
-    // Configure FTDI: reset, set baud rate, 8N1, no flow control
-    ftdi_reset_();
-    ftdi_set_baudrate_(baud_rate_);
-    ftdi_set_data_(FTDI_DATA_8N1);
-    ftdi_set_flow_ctrl_(0);
+    // Chip-specific initialization
+    if (chip_type_ == ChipType::FTDI) {
+      ftdi_init_();
+    } else if (chip_type_ == ChipType::CDC_ACM) {
+      cdc_set_line_coding_();
+    }
 
     usb_connected_.store(true);
-    ESP_LOGI(TAG, "FTDI FT232 configured (%d baud, 8N1)", baud_rate_);
 
-    // Start bulk read task
+    const char *type_str = chip_type_ == ChipType::FTDI ? "FTDI" :
+                           chip_type_ == ChipType::CDC_ACM ? "CDC-ACM" : "Generic";
+    ESP_LOGI(TAG, "USB device ready: %s (VID=%04X PID=%04X, %d baud, EP IN=0x%02X OUT=0x%02X)",
+             type_str, desc->idVendor, desc->idProduct, baud_rate_,
+             bulk_in_ep_, bulk_out_ep_);
+
     xTaskCreatePinnedToCore(bulk_read_task_entry_, "usb_rx", 4096,
                             this, 6, nullptr, 1);
   }
 
-  // ── Find bulk IN and OUT endpoints ────────────────────────
+  // ── Find bulk IN and OUT endpoints (all interfaces) ───────
   bool find_bulk_endpoints_(const usb_config_desc_t *config_desc) {
-    int offset = 0;
-    const usb_intf_desc_t *intf = nullptr;
     bulk_in_ep_ = 0;
     bulk_out_ep_ = 0;
 
-    // Find interface 0
     for (int i = 0; i < config_desc->bNumInterfaces; i++) {
-      intf = usb_parse_interface_descriptor(config_desc, i, 0, &offset);
-      if (intf && intf->bInterfaceNumber == 0) break;
-    }
-    if (!intf) return false;
+      int offset = 0;
+      const usb_intf_desc_t *intf = usb_parse_interface_descriptor(
+          config_desc, i, 0, &offset);
+      if (!intf) continue;
 
-    // Find bulk endpoints
-    for (int i = 0; i < intf->bNumEndpoints; i++) {
-      const usb_ep_desc_t *ep = usb_parse_endpoint_descriptor_by_index(
-          intf, i, config_desc->wTotalLength, &offset);
-      if (!ep) continue;
-      if ((ep->bmAttributes & USB_BM_ATTRIBUTES_XFERTYPE_MASK) == USB_BM_ATTRIBUTES_XFER_BULK) {
-        if (ep->bEndpointAddress & 0x80) {
-          bulk_in_ep_ = ep->bEndpointAddress;
-          bulk_in_mps_ = ep->wMaxPacketSize;
-          ESP_LOGD(TAG, "Bulk IN: EP 0x%02X (MPS=%d)", bulk_in_ep_, bulk_in_mps_);
-        } else {
-          bulk_out_ep_ = ep->bEndpointAddress;
-          ESP_LOGD(TAG, "Bulk OUT: EP 0x%02X", bulk_out_ep_);
+      // Skip interfaces without endpoints
+      if (intf->bNumEndpoints == 0) continue;
+
+      // For CDC-ACM: prefer the data interface (class 0x0A), not the control interface (0x02)
+      if (intf->bInterfaceClass == USB_CLASS_CDC && chip_type_ == ChipType::CDC_ACM) continue;
+
+      uint8_t in_ep = 0, out_ep = 0;
+      uint16_t in_mps = 64;
+
+      for (int j = 0; j < intf->bNumEndpoints; j++) {
+        const usb_ep_desc_t *ep = usb_parse_endpoint_descriptor_by_index(
+            intf, j, config_desc->wTotalLength, &offset);
+        if (!ep) continue;
+        if ((ep->bmAttributes & USB_BM_ATTRIBUTES_XFERTYPE_MASK) == USB_BM_ATTRIBUTES_XFER_BULK) {
+          if (ep->bEndpointAddress & 0x80) {
+            in_ep = ep->bEndpointAddress;
+            in_mps = ep->wMaxPacketSize;
+          } else {
+            out_ep = ep->bEndpointAddress;
+          }
         }
       }
+
+      if (in_ep && out_ep) {
+        bulk_in_ep_ = in_ep;
+        bulk_out_ep_ = out_ep;
+        bulk_in_mps_ = in_mps;
+        claimed_intf_ = intf->bInterfaceNumber;
+        ESP_LOGD(TAG, "Found bulk endpoints on interface %d: IN=0x%02X (MPS=%d) OUT=0x%02X",
+                 claimed_intf_, in_ep, in_mps, out_ep);
+        return true;
+      }
     }
-    return (bulk_in_ep_ != 0 && bulk_out_ep_ != 0);
+    return false;
   }
 
-  // ── FTDI vendor control requests ──────────────────────────
+  // ── FTDI initialization ───────────────────────────────────
+  void ftdi_init_() {
+    ftdi_control_(FTDI_REQ_RESET, 0, 0);       // Reset
+    ftdi_control_(FTDI_REQ_RESET, 1, 0);       // Purge RX
+    ftdi_control_(FTDI_REQ_RESET, 2, 0);       // Purge TX
+    uint16_t divisor = 3000000 / baud_rate_;
+    ftdi_control_(FTDI_REQ_SET_BAUDRATE, divisor, 0);
+    ftdi_control_(FTDI_REQ_SET_DATA, 0x0008, 0);   // 8N1
+    ftdi_control_(FTDI_REQ_SET_FLOW_CTRL, 0, 0);   // No flow control
+    ESP_LOGD(TAG, "FTDI configured: %d baud, 8N1", baud_rate_);
+  }
+
   esp_err_t ftdi_control_(uint8_t request, uint16_t value, uint16_t index) {
     usb_transfer_t *xfer;
-    esp_err_t err = usb_host_transfer_alloc(0, 0, &xfer);
+    esp_err_t err = usb_host_transfer_alloc(sizeof(usb_setup_packet_t), 0, &xfer);
     if (err != ESP_OK) return err;
 
     xfer->device_handle = dev_hdl_;
     xfer->bEndpointAddress = 0;
     xfer->callback = control_xfer_cb_;
     xfer->context = this;
-    xfer->num_bytes = 0;
     xfer->timeout_ms = 1000;
 
-    // Setup packet: vendor, host-to-device
     usb_setup_packet_t *setup = (usb_setup_packet_t *)xfer->data_buffer;
     setup->bmRequestType = USB_BM_REQUEST_TYPE_DIR_OUT |
                            USB_BM_REQUEST_TYPE_TYPE_VENDOR |
@@ -250,37 +324,55 @@ class UsbBridgeComponent : public Component {
       usb_host_transfer_free(xfer);
       return err;
     }
-    // Wait briefly for completion
     vTaskDelay(pdMS_TO_TICKS(50));
     return ESP_OK;
   }
 
+  // ── CDC-ACM SET_LINE_CODING ───────────────────────────────
+  void cdc_set_line_coding_() {
+    // SET_LINE_CODING: 7 bytes payload (baud, stop, parity, data bits)
+    usb_transfer_t *xfer;
+    esp_err_t err = usb_host_transfer_alloc(sizeof(usb_setup_packet_t) + 7, 0, &xfer);
+    if (err != ESP_OK) return;
+
+    xfer->device_handle = dev_hdl_;
+    xfer->bEndpointAddress = 0;
+    xfer->callback = control_xfer_cb_;
+    xfer->context = this;
+    xfer->timeout_ms = 1000;
+
+    usb_setup_packet_t *setup = (usb_setup_packet_t *)xfer->data_buffer;
+    setup->bmRequestType = USB_BM_REQUEST_TYPE_DIR_OUT |
+                           USB_BM_REQUEST_TYPE_TYPE_CLASS |
+                           USB_BM_REQUEST_TYPE_RECIP_INTERFACE;
+    setup->bRequest = CDC_SET_LINE_CODING;
+    setup->wValue = 0;
+    setup->wIndex = 0;
+    setup->wLength = 7;
+
+    // Line coding data: baud(4), stop(1), parity(1), databits(1)
+    uint8_t *data = xfer->data_buffer + sizeof(usb_setup_packet_t);
+    uint32_t baud = static_cast<uint32_t>(baud_rate_);
+    memcpy(data, &baud, 4);  // dwDTERate (little-endian)
+    data[4] = 0;  // bCharFormat: 1 stop bit
+    data[5] = 0;  // bParityType: none
+    data[6] = 8;  // bDataBits: 8
+    xfer->num_bytes = sizeof(usb_setup_packet_t) + 7;
+
+    err = usb_host_transfer_submit_control(client_hdl_, xfer);
+    if (err != ESP_OK) {
+      usb_host_transfer_free(xfer);
+      return;
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+    ESP_LOGD(TAG, "CDC-ACM line coding set: %d baud, 8N1", baud_rate_);
+  }
+
   static void control_xfer_cb_(usb_transfer_t *xfer) {
     if (xfer->status != USB_TRANSFER_STATUS_COMPLETED) {
-      ESP_LOGW(TAG, "Control transfer failed: status=%d", xfer->status);
+      ESP_LOGW(TAG, "Control transfer status=%d", xfer->status);
     }
     usb_host_transfer_free(xfer);
-  }
-
-  void ftdi_reset_() {
-    ftdi_control_(FTDI_REQ_RESET, 0, 0);  // Reset device
-    ftdi_control_(FTDI_REQ_RESET, 1, 0);  // Purge RX
-    ftdi_control_(FTDI_REQ_RESET, 2, 0);  // Purge TX
-  }
-
-  void ftdi_set_baudrate_(int baud) {
-    // FT232 base clock = 3,000,000 Hz
-    // Divisor = 3000000 / baud
-    uint16_t divisor = 3000000 / baud;
-    ftdi_control_(FTDI_REQ_SET_BAUDRATE, divisor, 0);
-  }
-
-  void ftdi_set_data_(uint16_t data_config) {
-    ftdi_control_(FTDI_REQ_SET_DATA, data_config, 0);
-  }
-
-  void ftdi_set_flow_ctrl_(uint16_t flow) {
-    ftdi_control_(FTDI_REQ_SET_FLOW_CTRL, 0, flow);
   }
 
   // ── Close USB device ──────────────────────────────────────
@@ -288,11 +380,12 @@ class UsbBridgeComponent : public Component {
     usb_connected_.store(false);
     xSemaphoreTake(usb_mutex_, portMAX_DELAY);
     if (dev_hdl_) {
-      usb_host_interface_release(client_hdl_, dev_hdl_, 0);
+      usb_host_interface_release(client_hdl_, dev_hdl_, claimed_intf_);
       usb_host_device_close(client_hdl_, dev_hdl_);
       dev_hdl_ = nullptr;
     }
     xSemaphoreGive(usb_mutex_);
+    chip_type_ = ChipType::UNKNOWN;
     ESP_LOGI(TAG, "USB device closed");
   }
 
@@ -324,7 +417,6 @@ class UsbBridgeComponent : public Component {
         }
         break;
       }
-      // Wait for callback (simple delay-based polling)
       vTaskDelay(pdMS_TO_TICKS(10));
     }
 
@@ -335,15 +427,21 @@ class UsbBridgeComponent : public Component {
 
   static void bulk_in_cb_(usb_transfer_t *xfer) {
     auto *self = static_cast<UsbBridgeComponent *>(xfer->context);
-    if (xfer->status == USB_TRANSFER_STATUS_COMPLETED && xfer->actual_num_bytes > FTDI_STATUS_BYTES) {
-      // Strip FTDI status bytes (first 2 bytes)
-      const uint8_t *data = xfer->data_buffer + FTDI_STATUS_BYTES;
-      size_t len = xfer->actual_num_bytes - FTDI_STATUS_BYTES;
+    if (xfer->status != USB_TRANSFER_STATUS_COMPLETED || xfer->actual_num_bytes == 0) return;
 
-      int fd = self->tcp_client_fd_.load();
-      if (fd >= 0 && len > 0) {
-        lwip_send(fd, data, len, MSG_DONTWAIT);
-      }
+    const uint8_t *data = xfer->data_buffer;
+    size_t len = xfer->actual_num_bytes;
+
+    // FTDI: strip 2-byte modem/line status prefix
+    if (self->chip_type_ == ChipType::FTDI) {
+      if (len <= 2) return;
+      data += 2;
+      len -= 2;
+    }
+
+    int fd = self->tcp_client_fd_.load();
+    if (fd >= 0 && len > 0) {
+      lwip_send(fd, data, len, MSG_DONTWAIT);
     }
   }
 
@@ -353,7 +451,6 @@ class UsbBridgeComponent : public Component {
   }
 
   void usb_task_() {
-    // Register as USB host client
     const usb_host_client_config_t client_config = {
         .is_synchronous = false,
         .max_num_event_msg = 5,
@@ -369,15 +466,14 @@ class UsbBridgeComponent : public Component {
       return;
     }
 
-    ESP_LOGI(TAG, "USB host client registered, waiting for FTDI device...");
+    ESP_LOGI(TAG, "USB host client registered, waiting for device...");
 
-    // Event loop — processes client events (new device, device gone)
     while (true) {
       usb_host_client_handle_events(client_hdl_, pdMS_TO_TICKS(1000));
     }
   }
 
-  // ── TCP → USB write helper ────────────────────────────────
+  // ── TCP → USB write ───────────────────────────────────────
   void usb_write_(const uint8_t *data, size_t len) {
     xSemaphoreTake(usb_mutex_, portMAX_DELAY);
     if (!dev_hdl_ || !usb_connected_.load()) {
@@ -473,7 +569,6 @@ class UsbBridgeComponent : public Component {
         lwip_setsockopt(client_fd, SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof(opt));
         tcp_client_fd_.store(client_fd);
 
-        // Forward TCP → USB
         uint8_t buf[256];
         while (true) {
           int len = lwip_recv(client_fd, buf, sizeof(buf), 0);
