@@ -64,7 +64,10 @@ struct DiscoveredDevice {
   uint8_t dev_class;
   uint8_t num_interfaces;
   bool is_hub;
-  bool is_assigned;  // already mapped to a config slot
+  bool is_assigned;
+  char manufacturer[64];
+  char product[64];
+  char serial[64];
 };
 
 // ── Saved device config (from NVS) ──────────────────────────
@@ -206,6 +209,20 @@ class UsbBridgeComponent : public Component {
   usb_transfer_status_t ctrl_xfer_status_{};
   uint16_t ctrl_xfer_actual_{0};
 
+  // ── Convert USB string descriptor (UTF-16LE) to ASCII ──────
+  static void str_desc_to_ascii_(const usb_str_desc_t *desc, char *out, size_t max_len) {
+    out[0] = 0;
+    if (!desc || desc->bLength < 4) return;
+    // bLength includes 2-byte header, rest is UTF-16LE chars
+    size_t num_chars = (desc->bLength - 2) / 2;
+    if (num_chars >= max_len) num_chars = max_len - 1;
+    for (size_t i = 0; i < num_chars; i++) {
+      uint16_t wchar = desc->wData[i];
+      out[i] = (wchar < 128) ? (char)wchar : '?';
+    }
+    out[num_chars] = 0;
+  }
+
   // ── Load config from NVS ──────────────────────────────────
   void load_nvs_config_() {
     std::vector<StoredDeviceConfig> stored;
@@ -279,13 +296,10 @@ class UsbBridgeComponent : public Component {
              desc->idVendor, desc->idProduct, desc->bDeviceClass,
              is_hub ? " (hub)" : "");
 
-    // Add to discovered list
-    xSemaphoreTake(discovery_mutex_, portMAX_DELAY);
-    // Remove stale entry with same addr
-    for (auto it = discovered_.begin(); it != discovered_.end(); ) {
-      if (it->addr == dev_addr) it = discovered_.erase(it);
-      else ++it;
-    }
+    // Read device string descriptors (manufacturer, product, serial)
+    usb_device_info_t dev_info = {};
+    usb_host_device_info(dev, &dev_info);
+
     DiscoveredDevice dd = {};
     dd.addr = dev_addr;
     dd.vid = desc->idVendor;
@@ -294,12 +308,25 @@ class UsbBridgeComponent : public Component {
     dd.is_hub = is_hub;
     dd.is_assigned = false;
 
+    str_desc_to_ascii_(dev_info.str_desc_manufacturer, dd.manufacturer, sizeof(dd.manufacturer));
+    str_desc_to_ascii_(dev_info.str_desc_product, dd.product, sizeof(dd.product));
+    str_desc_to_ascii_(dev_info.str_desc_serial_num, dd.serial, sizeof(dd.serial));
+
+    ESP_LOGI(TAG, "  Manufacturer: %s", dd.manufacturer[0] ? dd.manufacturer : "(none)");
+    ESP_LOGI(TAG, "  Product: %s", dd.product[0] ? dd.product : "(none)");
+
     const usb_config_desc_t *config_desc = nullptr;
     if (!is_hub) {
       usb_host_get_active_config_descriptor(dev, &config_desc);
       if (config_desc) dd.num_interfaces = config_desc->bNumInterfaces;
     }
 
+    // Add to discovered list
+    xSemaphoreTake(discovery_mutex_, portMAX_DELAY);
+    for (auto it = discovered_.begin(); it != discovered_.end(); ) {
+      if (it->addr == dev_addr) it = discovered_.erase(it);
+      else ++it;
+    }
     discovered_.push_back(dd);
     xSemaphoreGive(discovery_mutex_);
 
@@ -792,14 +819,16 @@ static esp_err_t handle_get_status_(httpd_req_t *req) {
   p += snprintf(p, end - p, "],\"discovered\":[");
 
   xSemaphoreTake(comp->get_discovery_mutex(), portMAX_DELAY);
-  for (size_t i = 0; i < disc.size() && p < end - 100; i++) {
+  for (size_t i = 0; i < disc.size() && p < end - 300; i++) {
     if (i > 0) *p++ = ',';
     p += snprintf(p, end - p,
-        "{\"addr\":%d,\"vid\":%d,\"pid\":%d,\"class\":%d,\"hub\":%s,\"assigned\":%s,\"interfaces\":%d}",
+        "{\"addr\":%d,\"vid\":%d,\"pid\":%d,\"class\":%d,\"hub\":%s,\"assigned\":%s,"
+        "\"interfaces\":%d,\"manufacturer\":\"%s\",\"product\":\"%s\",\"serial\":\"%s\"}",
         disc[i].addr, disc[i].vid, disc[i].pid, disc[i].dev_class,
         disc[i].is_hub ? "true" : "false",
         disc[i].is_assigned ? "true" : "false",
-        disc[i].num_interfaces);
+        disc[i].num_interfaces,
+        disc[i].manufacturer, disc[i].product, disc[i].serial);
   }
   xSemaphoreGive(comp->get_discovery_mutex());
 

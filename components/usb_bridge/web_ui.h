@@ -191,10 +191,12 @@ function renderDiscovered(){
   devs.forEach(d=>{
     const assigned=d.assigned||configs.some(c=>c.vid===d.vid&&c.pid===d.pid);
     const st=assigned?'<span class="status on">Assigned</span>':'<span class="status avail">Available</span>';
+    const name=d.product||chipName(d.vid);
+    const mfr=d.manufacturer?d.manufacturer+' &middot; ':'';
     c.innerHTML+=`<div class="card discovered">
-      <strong>${chipName(d.vid)}</strong> ${st}
-      <div class="dev-info">VID: ${hex4(d.vid)} &middot; PID: ${hex4(d.pid)} &middot; Addr: ${d.addr} &middot; Interfaces: ${d.interfaces||1}</div>
-      ${assigned?'':'<button class="btn btn-add" onclick="addFromDevice('+d.vid+','+d.pid+','+d.addr+')">+ Configure</button>'}
+      <strong>${esc(name)}</strong> ${st}
+      <div class="dev-info">${esc(mfr)}VID: ${hex4(d.vid)} &middot; PID: ${hex4(d.pid)} &middot; Intf: ${d.interfaces||1}${d.serial?' &middot; S/N: '+esc(d.serial):''}</div>
+      ${assigned?'':'<button class="btn btn-add" onclick="addFromDevice('+d.vid+','+d.pid+',\''+esc(name)+'\')">+ Configure</button>'}
     </div>`;
   });
 }
@@ -224,9 +226,9 @@ function renderConfigs(){
   });
 }
 
-function addFromDevice(vid,pid,addr){
+function addFromDevice(vid,pid,name){
   const next=8880+configs.length;
-  configs.push({name:chipName(vid)+' ('+hex4(vid)+':'+hex4(pid)+')',vid,pid,port:next,baud_rate:115200,interface:0,autoboot:vid===0x10C4});
+  configs.push({name:name||chipName(vid),vid,pid,port:next,baud_rate:115200,interface:0,autoboot:vid===0x10C4});
   renderConfigs();renderDiscovered();
   toast('Device added! Set TCP port and baud rate, then Save & Reboot.');
 }
