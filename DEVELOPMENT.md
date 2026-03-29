@@ -79,16 +79,18 @@ USB Device ←→ [Bulk IN/OUT] ←→ ESP32-S3 ←→ [TCP:8880] ←→ HA Add-
 ```
 CONFIG_USB_OTG_SUPPORTED=y
 CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=1024
-CONFIG_USB_HOST_HUBS_SUPPORTED=y          # Basic hub support (IDF 5.2+)
-CONFIG_USB_HOST_HUB_MULTI_LEVEL=y         # Nested hub support (IDF 5.4+)
-CONFIG_USB_HOST_EXT_HUB_MAX_PORTS=4       # Max ports per external hub
-CONFIG_USB_HOST_DEBOUNCE_DELAY_MS=300     # Default 250, increased for slow hubs
-CONFIG_USB_HOST_RESET_HOLD_MS=50          # Default 30, increased for reliability
-CONFIG_USB_HOST_RESET_RECOVERY_MS=50      # Default 30, increased for reliability
-CONFIG_USB_HOST_SET_ADDR_RECOVERY_MS=20   # Default 10, increased for reliability
+CONFIG_SPIRAM=n                           # PSRAM breaks USB host (IDF #9519)
+CONFIG_ESP32S3_SPIRAM_SUPPORT=n           # Both needed to fully disable PSRAM
 ```
 Set in `__init__.py` via `add_idf_sdkconfig_option`. YAML `sdkconfig_options` has
 the base USB OTG option only.
+
+### Failed sdkconfig attempts (don't repeat!)
+- `CONFIG_USB_HOST_HUBS_SUPPORTED` — may not exist in IDF 5.5.2
+- `CONFIG_USB_HOST_HUB_MULTI_LEVEL` — didn't fix root port reset
+- `CONFIG_USB_HOST_DEBOUNCE_DELAY_MS` / `RESET_HOLD_MS` etc. — didn't help
+- `CONFIG_USB_HOST_ISR_IRAM_SAFE` — may not exist
+- All timing-related options were ineffective
 
 ## ESP-IDF Version
 - ESPHome 2026.1.0 uses **ESP-IDF 5.5.2** (`version: recommended`)
