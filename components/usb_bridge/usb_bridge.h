@@ -27,7 +27,7 @@ namespace esphome {
 namespace usb_bridge {
 
 static const char *const TAG = "usb_bridge";
-static const char *const FW_BUILD_ID = "usb-bridge build 2026-03-31-f";
+static const char *const FW_BUILD_ID = "usb-bridge build 2026-03-31-g";
 
 // Known USB serial chip vendors
 static constexpr uint16_t FTDI_VID = 0x0403;
@@ -179,36 +179,6 @@ struct DeviceConnection {
   SemaphoreHandle_t bulk_in_sem{nullptr};
 };
 
-// ── Optional enum filter (YAML skip_cp210x_bcd_device) ──────
-// Hubs with internal CP2102 often use bcdDevice 0x0100 while sticks differ. Skipping
-// by bcdDevice avoids rejecting a real stick when enumeration order changes.
-// Set to 0 to disable (enumerate everything). Example: 256 = 0x0100.
-static uint16_t g_enum_skip_cp210x_bcd = 0;
-
-static bool enum_filter_hub_vid_(const usb_device_desc_t *d) {
-  if (d->bDeviceClass == USB_CLASS_HUB)
-    return true;
-  if (d->idVendor == 0x1A40 && (d->idProduct == 0x0201 || d->idProduct == 0x0101))
-    return true;
-  if (d->idVendor == 0x05E3 && d->idProduct >= 0x0600 && d->idProduct <= 0x0620)
-    return true;
-  if (d->idVendor == 0x2109)
-    return true;
-  return false;
-}
-
-static bool enum_filter_cb_(const usb_device_desc_t *dev_desc, uint8_t *bConfigurationValue) {
-  if (enum_filter_hub_vid_(dev_desc))
-    return true;
-
-  if (g_enum_skip_cp210x_bcd != 0 && dev_desc->idVendor == 0x10C4 && dev_desc->idProduct == 0xEA60 &&
-      dev_desc->bcdDevice == g_enum_skip_cp210x_bcd) {
-    ESP_LOGW(TAG, "Enum filter: skip CP210x bcdDevice=0x%04X (hub-internal typical)", dev_desc->bcdDevice);
-    return false;
-  }
-  return true;
-}
-
 static void phy_se0_pulse_ms_(int ms) {
   gpio_config_t io_conf = {};
   io_conf.intr_type = GPIO_INTR_DISABLE;
@@ -226,8 +196,6 @@ static void phy_se0_pulse_ms_(int ms) {
 
 class UsbBridgeComponent : public Component {
  public:
-  void set_skip_cp210x_bcd_device(uint16_t v) { skip_cp210x_bcd_device_ = v; }
-
   std::vector<DeviceConnection*>& get_connections() { return connections_; }
   std::vector<DiscoveredDevice>& get_discovered() { return discovered_; }
   SemaphoreHandle_t get_discovery_mutex() { return discovery_mutex_; }
@@ -240,11 +208,7 @@ class UsbBridgeComponent : public Component {
     log_ring_init_();
     BRIDGE_LOG("USB Gateway initializing...");
     BRIDGE_LOG("%s", FW_BUILD_ID);
-    if (skip_cp210x_bcd_device_ != 0) {
-      BRIDGE_LOG("USB enum filter: ON (skip CP210x if bcdDevice=0x%04X)", skip_cp210x_bcd_device_);
-    } else {
-      BRIDGE_LOG("USB enum filter: OFF");
-    }
+    BRIDGE_LOG("USB host: enumerate all devices (no enum filter; assignment via web UI + NVS)");
     // Avoid ESP32 OTA rollback during rapid reboot test cycles.
     // If rollback isn't pending, ESP_ERR_INVALID_STATE is expected and harmless.
     esp_err_t ota_mark = esp_ota_mark_app_valid_cancel_rollback();
@@ -259,26 +223,28 @@ class UsbBridgeComponent : public Component {
     ctrl_xfer_done_ = xSemaphoreCreateBinary();
     new_dev_queue_ = xQueueCreate(8, sizeof(uint8_t));
 
-    // ── USB PHY reset (double pulse helps some hubs re-enumerate after reboot) ──
-    BRIDGE_LOG("USB PHY reset pulse 1: SE0 GPIO19/20 100ms...");
-    phy_se0_pulse_ms_(100);
-    BRIDGE_LOG("USB PHY reset pause 500ms...");
-    vTaskDelay(pdMS_TO_TICKS(500));
-    BRIDGE_LOG("USB PHY reset pulse 2: SE0 GPIO19/20 100ms...");
-    phy_se0_pulse_ms_(100);
-    BRIDGE_LOG("PHY reset done, waiting 3s for hub to settle...");
-    vTaskDelay(pdMS_TO_TICKS(3000));
+    // ── USB PHY reset (SE0 on D+/D-): helps hub see disconnect and re-enumerate after ESP reboot
+    BRIDGE_LOG("USB PHY: allow power/VDD stabilize 300ms...");
+    vTaskDelay(pdMS_TO_TICKS(300));
+    for (int i = 1; i <= 3; i++) {
+      BRIDGE_LOG("USB PHY SE0 pulse %d/3: GPIO19/20 LOW %dms...", i, i == 2 ? 150 : 100);
+      phy_se0_pulse_ms_(i == 2 ? 150 : 100);
+      if (i < 3) {
+        BRIDGE_LOG("USB PHY pause 400ms...");
+        vTaskDelay(pdMS_TO_TICKS(400));
+      }
+    }
+    BRIDGE_LOG("PHY settle: waiting 5s for hub + downstream to enumerate...");
+    vTaskDelay(pdMS_TO_TICKS(5000));
 
     load_nvs_config_();
     BRIDGE_LOG("Loaded %zu saved device configs from NVS", connections_.size());
-
-    g_enum_skip_cp210x_bcd = skip_cp210x_bcd_device_;
 
     // ── Install USB Host + register client ───────────────────
     const usb_host_config_t host_config = {
         .skip_phy_setup = false,
         .intr_flags = ESP_INTR_FLAG_LEVEL1,
-        .enum_filter_cb = (skip_cp210x_bcd_device_ != 0) ? enum_filter_cb_ : nullptr,
+        .enum_filter_cb = nullptr,
     };
     esp_err_t err = usb_host_install(&host_config);
     if (err != ESP_OK) {
@@ -336,9 +302,6 @@ class UsbBridgeComponent : public Component {
 
  private:
   static UsbBridgeComponent *instance_;
-
-  /// If non-zero, enum filter rejects CP210x (10C4:EA60) with this bcdDevice (see YAML).
-  uint16_t skip_cp210x_bcd_device_{0};
 
   std::vector<DeviceConnection*> connections_;
   std::vector<DiscoveredDevice> discovered_;
