@@ -27,7 +27,7 @@ namespace esphome {
 namespace usb_bridge {
 
 static const char *const TAG = "usb_bridge";
-static const char *const FW_BUILD_ID = "usb-bridge build 2026-03-31-d";
+static const char *const FW_BUILD_ID = "usb-bridge build 2026-03-31-e";
 
 // Known USB serial chip vendors
 static constexpr uint16_t FTDI_VID = 0x0403;
@@ -179,8 +179,66 @@ struct DeviceConnection {
   SemaphoreHandle_t bulk_in_sem{nullptr};
 };
 
+// ── Optional enum filter (YAML reject_second_cp210x) ─────────
+// Powered hubs with an internal CP2102 (S/N 0001) enumerate as a 3rd CP210x and
+// exhaust ESP32-S3 HCD channels; rejecting the 2nd CP210x in enumeration order
+// drops that bridge so SkyConnect + Sonoff can both interface_claim().
+// Do not enable if you only have two CP210x sticks and no hub-internal bridge.
+static std::vector<StoredDeviceConfig> enum_filter_configs_;
+static int g_cp210x_enum_count = 0;
+
+static bool enum_filter_hub_vid_(const usb_device_desc_t *d) {
+  if (d->bDeviceClass == USB_CLASS_HUB)
+    return true;
+  if (d->idVendor == 0x1A40 && (d->idProduct == 0x0201 || d->idProduct == 0x0101))
+    return true;
+  if (d->idVendor == 0x05E3 && d->idProduct >= 0x0600 && d->idProduct <= 0x0620)
+    return true;
+  if (d->idVendor == 0x2109)
+    return true;
+  return false;
+}
+
+static bool enum_filter_cb_(const usb_device_desc_t *dev_desc, uint8_t *bConfigurationValue) {
+  if (enum_filter_hub_vid_(dev_desc))
+    return true;
+
+  if (dev_desc->idVendor == 0x10C4 && dev_desc->idProduct == 0xEA60) {
+    g_cp210x_enum_count++;
+    if (g_cp210x_enum_count == 2) {
+      ESP_LOGW(TAG, "Enum filter: skip 2nd CP210x (hub bridge, saves HCD channels)");
+      return false;
+    }
+    return true;
+  }
+
+  for (const auto &cfg : enum_filter_configs_) {
+    if (cfg.vid == dev_desc->idVendor && cfg.pid == dev_desc->idProduct)
+      return true;
+  }
+  ESP_LOGW(TAG, "Enum filter: reject VID=%04X PID=%04X (no NVS config)", dev_desc->idVendor, dev_desc->idProduct);
+  return false;
+}
+
+static void phy_se0_pulse_ms_(int ms) {
+  gpio_config_t io_conf = {};
+  io_conf.intr_type = GPIO_INTR_DISABLE;
+  io_conf.mode = GPIO_MODE_OUTPUT;
+  io_conf.pin_bit_mask = (1ULL << 19) | (1ULL << 20);
+  io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+  io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
+  gpio_config(&io_conf);
+  gpio_set_level(GPIO_NUM_19, 0);
+  gpio_set_level(GPIO_NUM_20, 0);
+  vTaskDelay(pdMS_TO_TICKS(ms));
+  io_conf.mode = GPIO_MODE_INPUT;
+  gpio_config(&io_conf);
+}
+
 class UsbBridgeComponent : public Component {
  public:
+  void set_reject_second_cp210x(bool v) { reject_second_cp210x_ = v; }
+
   std::vector<DeviceConnection*>& get_connections() { return connections_; }
   std::vector<DiscoveredDevice>& get_discovered() { return discovered_; }
   SemaphoreHandle_t get_discovery_mutex() { return discovery_mutex_; }
@@ -193,7 +251,11 @@ class UsbBridgeComponent : public Component {
     log_ring_init_();
     BRIDGE_LOG("USB Gateway initializing...");
     BRIDGE_LOG("%s", FW_BUILD_ID);
-    BRIDGE_LOG("USB enum filter: disabled (enumerate all; avoids empty discovered if hub VID unknown)");
+    if (reject_second_cp210x_) {
+      BRIDGE_LOG("USB enum filter: ON (reject_second_cp210x — skip hub-internal CP210x)");
+    } else {
+      BRIDGE_LOG("USB enum filter: OFF (enumerate all devices)");
+    }
     // Avoid ESP32 OTA rollback during rapid reboot test cycles.
     // If rollback isn't pending, ESP_ERR_INVALID_STATE is expected and harmless.
     esp_err_t ota_mark = esp_ota_mark_app_valid_cancel_rollback();
@@ -208,35 +270,34 @@ class UsbBridgeComponent : public Component {
     ctrl_xfer_done_ = xSemaphoreCreateBinary();
     new_dev_queue_ = xQueueCreate(8, sizeof(uint8_t));
 
-    // ── USB PHY reset ────────────────────────────────────────
-    // Drive D+/D- LOW to force hub to detect disconnect.
-    // This ensures devices are re-enumerated after ESP32 reboot
-    // without needing to physically unplug the hub.
-    BRIDGE_LOG("USB PHY reset: SE0 on GPIO19/20 for 100ms...");
-    gpio_config_t io_conf = {};
-    io_conf.intr_type = GPIO_INTR_DISABLE;
-    io_conf.mode = GPIO_MODE_OUTPUT;
-    io_conf.pin_bit_mask = (1ULL << 19) | (1ULL << 20);
-    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
-    io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
-    gpio_config(&io_conf);
-    gpio_set_level(GPIO_NUM_19, 0);
-    gpio_set_level(GPIO_NUM_20, 0);
-    vTaskDelay(pdMS_TO_TICKS(100));
-    // Release pins back to USB PHY
-    io_conf.mode = GPIO_MODE_INPUT;
-    gpio_config(&io_conf);
+    // ── USB PHY reset (double pulse helps some hubs re-enumerate after reboot) ──
+    BRIDGE_LOG("USB PHY reset pulse 1: SE0 GPIO19/20 100ms...");
+    phy_se0_pulse_ms_(100);
+    BRIDGE_LOG("USB PHY reset pause 500ms...");
+    vTaskDelay(pdMS_TO_TICKS(500));
+    BRIDGE_LOG("USB PHY reset pulse 2: SE0 GPIO19/20 100ms...");
+    phy_se0_pulse_ms_(100);
     BRIDGE_LOG("PHY reset done, waiting 3s for hub to settle...");
     vTaskDelay(pdMS_TO_TICKS(3000));
 
     load_nvs_config_();
     BRIDGE_LOG("Loaded %zu saved device configs from NVS", connections_.size());
 
+    g_cp210x_enum_count = 0;
+    enum_filter_configs_.clear();
+    for (auto *conn : connections_) {
+      StoredDeviceConfig fc = {};
+      fc.vid = conn->config.vid;
+      fc.pid = conn->config.pid;
+      strncpy(fc.serial, conn->config.serial, sizeof(fc.serial) - 1);
+      enum_filter_configs_.push_back(fc);
+    }
+
     // ── Install USB Host + register client ───────────────────
     const usb_host_config_t host_config = {
         .skip_phy_setup = false,
         .intr_flags = ESP_INTR_FLAG_LEVEL1,
-        .enum_filter_cb = nullptr,
+        .enum_filter_cb = reject_second_cp210x_ ? enum_filter_cb_ : nullptr,
     };
     esp_err_t err = usb_host_install(&host_config);
     if (err != ESP_OK) {
@@ -294,6 +355,9 @@ class UsbBridgeComponent : public Component {
 
  private:
   static UsbBridgeComponent *instance_;
+
+  /// When true, enum filter skips 2nd CP210x (hub-internal bridge); set from YAML.
+  bool reject_second_cp210x_{false};
 
   std::vector<DeviceConnection*> connections_;
   std::vector<DiscoveredDevice> discovered_;

@@ -59,4 +59,8 @@ ota:
 # No YAML device config needed!
 # All device configuration is done via web UI at http://<device-ip>:81/
 # Detected USB devices are shown automatically, assign them to TCP ports in the UI.
+#
+# If your powered hub has an internal CP2102 (S/N 0001), enable this so the 2nd CP210x
+# is not enumerated and both Zigbee sticks can claim interfaces (8 HCD channel limit).
 usb_bridge:
+  reject_second_cp210x: true
