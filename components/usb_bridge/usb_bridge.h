@@ -27,7 +27,7 @@ namespace esphome {
 namespace usb_bridge {
 
 static const char *const TAG = "usb_bridge";
-static const char *const FW_BUILD_ID = "usb-bridge build 2026-03-31-e";
+static const char *const FW_BUILD_ID = "usb-bridge build 2026-03-31-f";
 
 // Known USB serial chip vendors
 static constexpr uint16_t FTDI_VID = 0x0403;
@@ -179,13 +179,11 @@ struct DeviceConnection {
   SemaphoreHandle_t bulk_in_sem{nullptr};
 };
 
-// ── Optional enum filter (YAML reject_second_cp210x) ─────────
-// Powered hubs with an internal CP2102 (S/N 0001) enumerate as a 3rd CP210x and
-// exhaust ESP32-S3 HCD channels; rejecting the 2nd CP210x in enumeration order
-// drops that bridge so SkyConnect + Sonoff can both interface_claim().
-// Do not enable if you only have two CP210x sticks and no hub-internal bridge.
-static std::vector<StoredDeviceConfig> enum_filter_configs_;
-static int g_cp210x_enum_count = 0;
+// ── Optional enum filter (YAML skip_cp210x_bcd_device) ──────
+// Hubs with internal CP2102 often use bcdDevice 0x0100 while sticks differ. Skipping
+// by bcdDevice avoids rejecting a real stick when enumeration order changes.
+// Set to 0 to disable (enumerate everything). Example: 256 = 0x0100.
+static uint16_t g_enum_skip_cp210x_bcd = 0;
 
 static bool enum_filter_hub_vid_(const usb_device_desc_t *d) {
   if (d->bDeviceClass == USB_CLASS_HUB)
@@ -203,21 +201,12 @@ static bool enum_filter_cb_(const usb_device_desc_t *dev_desc, uint8_t *bConfigu
   if (enum_filter_hub_vid_(dev_desc))
     return true;
 
-  if (dev_desc->idVendor == 0x10C4 && dev_desc->idProduct == 0xEA60) {
-    g_cp210x_enum_count++;
-    if (g_cp210x_enum_count == 2) {
-      ESP_LOGW(TAG, "Enum filter: skip 2nd CP210x (hub bridge, saves HCD channels)");
-      return false;
-    }
-    return true;
+  if (g_enum_skip_cp210x_bcd != 0 && dev_desc->idVendor == 0x10C4 && dev_desc->idProduct == 0xEA60 &&
+      dev_desc->bcdDevice == g_enum_skip_cp210x_bcd) {
+    ESP_LOGW(TAG, "Enum filter: skip CP210x bcdDevice=0x%04X (hub-internal typical)", dev_desc->bcdDevice);
+    return false;
   }
-
-  for (const auto &cfg : enum_filter_configs_) {
-    if (cfg.vid == dev_desc->idVendor && cfg.pid == dev_desc->idProduct)
-      return true;
-  }
-  ESP_LOGW(TAG, "Enum filter: reject VID=%04X PID=%04X (no NVS config)", dev_desc->idVendor, dev_desc->idProduct);
-  return false;
+  return true;
 }
 
 static void phy_se0_pulse_ms_(int ms) {
@@ -237,7 +226,7 @@ static void phy_se0_pulse_ms_(int ms) {
 
 class UsbBridgeComponent : public Component {
  public:
-  void set_reject_second_cp210x(bool v) { reject_second_cp210x_ = v; }
+  void set_skip_cp210x_bcd_device(uint16_t v) { skip_cp210x_bcd_device_ = v; }
 
   std::vector<DeviceConnection*>& get_connections() { return connections_; }
   std::vector<DiscoveredDevice>& get_discovered() { return discovered_; }
@@ -251,10 +240,10 @@ class UsbBridgeComponent : public Component {
     log_ring_init_();
     BRIDGE_LOG("USB Gateway initializing...");
     BRIDGE_LOG("%s", FW_BUILD_ID);
-    if (reject_second_cp210x_) {
-      BRIDGE_LOG("USB enum filter: ON (reject_second_cp210x — skip hub-internal CP210x)");
+    if (skip_cp210x_bcd_device_ != 0) {
+      BRIDGE_LOG("USB enum filter: ON (skip CP210x if bcdDevice=0x%04X)", skip_cp210x_bcd_device_);
     } else {
-      BRIDGE_LOG("USB enum filter: OFF (enumerate all devices)");
+      BRIDGE_LOG("USB enum filter: OFF");
     }
     // Avoid ESP32 OTA rollback during rapid reboot test cycles.
     // If rollback isn't pending, ESP_ERR_INVALID_STATE is expected and harmless.
@@ -283,21 +272,13 @@ class UsbBridgeComponent : public Component {
     load_nvs_config_();
     BRIDGE_LOG("Loaded %zu saved device configs from NVS", connections_.size());
 
-    g_cp210x_enum_count = 0;
-    enum_filter_configs_.clear();
-    for (auto *conn : connections_) {
-      StoredDeviceConfig fc = {};
-      fc.vid = conn->config.vid;
-      fc.pid = conn->config.pid;
-      strncpy(fc.serial, conn->config.serial, sizeof(fc.serial) - 1);
-      enum_filter_configs_.push_back(fc);
-    }
+    g_enum_skip_cp210x_bcd = skip_cp210x_bcd_device_;
 
     // ── Install USB Host + register client ───────────────────
     const usb_host_config_t host_config = {
         .skip_phy_setup = false,
         .intr_flags = ESP_INTR_FLAG_LEVEL1,
-        .enum_filter_cb = reject_second_cp210x_ ? enum_filter_cb_ : nullptr,
+        .enum_filter_cb = (skip_cp210x_bcd_device_ != 0) ? enum_filter_cb_ : nullptr,
     };
     esp_err_t err = usb_host_install(&host_config);
     if (err != ESP_OK) {
@@ -356,8 +337,8 @@ class UsbBridgeComponent : public Component {
  private:
   static UsbBridgeComponent *instance_;
 
-  /// When true, enum filter skips 2nd CP210x (hub-internal bridge); set from YAML.
-  bool reject_second_cp210x_{false};
+  /// If non-zero, enum filter rejects CP210x (10C4:EA60) with this bcdDevice (see YAML).
+  uint16_t skip_cp210x_bcd_device_{0};
 
   std::vector<DeviceConnection*> connections_;
   std::vector<DiscoveredDevice> discovered_;
@@ -467,6 +448,9 @@ class UsbBridgeComponent : public Component {
     BRIDGE_LOG("Device addr=%d: VID=%04X PID=%04X Class=%02X%s",
              dev_addr, desc->idVendor, desc->idProduct, desc->bDeviceClass,
              is_hub ? " [HUB]" : "");
+    BRIDGE_LOG("  bcdUSB=0x%04X bcdDevice=0x%04X iMfg=%u iProduct=%u iSerial=%u",
+             desc->bcdUSB, desc->bcdDevice, desc->iManufacturer,
+             desc->iProduct, desc->iSerialNumber);
 
     // Read device string descriptors
     usb_device_info_t dev_info = {};
@@ -518,8 +502,12 @@ class UsbBridgeComponent : public Component {
       bool vid_match = (conn->config.vid == desc->idVendor);
       bool pid_match = (conn->config.pid == desc->idProduct);
       bool serial_match = true;
-      if (conn->config.serial[0] != '\0' && dd.serial[0] != '\0') {
-        serial_match = (strcmp(conn->config.serial, dd.serial) == 0);
+      if (conn->config.serial[0] != '\0') {
+        if (dd.serial[0] == '\0') {
+          serial_match = false;
+        } else {
+          serial_match = (strcmp(conn->config.serial, dd.serial) == 0);
+        }
       }
       if (vid_match && pid_match && serial_match && !conn->connected.load()) {
         target = conn;
