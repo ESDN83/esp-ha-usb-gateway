@@ -68,7 +68,7 @@ static const char *chip_type_str(ChipType t) {
 }
 
 // ── Ring buffer debug log ──────────────────────────────────
-static constexpr size_t LOG_RING_SIZE = 4096;
+static constexpr size_t LOG_RING_SIZE = 16384;
 static char log_ring_[LOG_RING_SIZE];
 static size_t log_ring_head_ = 0;
 static SemaphoreHandle_t log_ring_mutex_ = nullptr;
@@ -232,7 +232,7 @@ class UsbBridgeComponent : public Component {
 
     const usb_host_client_config_t client_config = {
         .is_synchronous = false,
-        .max_num_event_msg = 5,
+        .max_num_event_msg = 10,
         .async = {
             .client_event_callback = client_event_cb_,
             .callback_arg = this,
@@ -249,8 +249,16 @@ class UsbBridgeComponent : public Component {
     load_nvs_config_();
     BRIDGE_LOG("Loaded %zu saved device configs from NVS", connections_.size());
 
-    // Start USB lib daemon + monitor task
+    // Start USB lib daemon (processes transfers + hub driver events)
     xTaskCreatePinnedToCore(usb_lib_task_, "usb_lib", 8192, nullptr, 10, nullptr, 0);
+
+    // ── Hub port power cycle ─────────────────────────────────
+    // ESP-IDF hub driver enumerates hubs internally (no client callback).
+    // We poll for the hub device, open it by address, and power-cycle ports.
+    BRIDGE_LOG("Waiting for hub enumeration (polling)...");
+    hub_power_cycle_(client_hdl_);
+
+    // Start monitor task (handles device events from now on)
     xTaskCreatePinnedToCore(usb_task_entry_, "usb_mon", 8192, this, 5, nullptr, 1);
 
     // Launch TCP servers for saved configs
@@ -295,6 +303,76 @@ class UsbBridgeComponent : public Component {
   uint8_t hub_addr_{0};
   uint8_t hub_num_ports_{0};
   bool hub_power_cycle_done_{false};
+
+  // ── Hub port power cycle (called from setup) ──────────────
+  // ESP-IDF hub driver handles hubs internally — no NEW_DEV event for hubs.
+  // We poll usb_host_device_addr_list_fill() to find the hub, open it,
+  // and power-cycle its downstream ports to force device re-enumeration.
+  void hub_power_cycle_(usb_host_client_handle_t client) {
+    // Process events so the hub gets enumerated by the built-in driver
+    for (int i = 0; i < 50; i++) {
+      usb_host_client_handle_events(client, pdMS_TO_TICKS(100));
+
+      // Check if any devices have appeared
+      int num_devs = 0;
+      uint8_t addrs[8] = {};
+      usb_host_device_addr_list_fill(sizeof(addrs) / sizeof(addrs[0]), addrs, &num_devs);
+      if (num_devs > 0) {
+        BRIDGE_LOG("[hub] Found %d device(s) on bus after %dms", num_devs, (i + 1) * 100);
+        // Try each address to find the hub
+        for (int d = 0; d < num_devs; d++) {
+          usb_device_handle_t dev = nullptr;
+          if (usb_host_device_open(client, addrs[d], &dev) != ESP_OK) continue;
+
+          const usb_device_desc_t *desc = nullptr;
+          usb_host_get_device_descriptor(dev, &desc);
+          if (desc && desc->bDeviceClass == USB_CLASS_HUB) {
+            hub_addr_ = addrs[d];
+            BRIDGE_LOG("[hub] Hub found at addr=%d (VID=%04X PID=%04X)", addrs[d], desc->idVendor, desc->idProduct);
+
+            // Read hub descriptor for port count
+            uint8_t hub_desc[16] = {};
+            esp_err_t herr = ctrl_transfer_sync_(dev,
+                USB_BM_REQUEST_TYPE_DIR_IN | USB_BM_REQUEST_TYPE_TYPE_CLASS | USB_BM_REQUEST_TYPE_RECIP_DEVICE,
+                USB_HUB_REQ_GET_DESCRIPTOR, (0x29 << 8), 0, sizeof(hub_desc), hub_desc);
+            uint8_t num_ports = (herr == ESP_OK && hub_desc[0] >= 3) ? hub_desc[2] : 4;
+            hub_num_ports_ = num_ports;
+            BRIDGE_LOG("[hub] Ports: %d (descriptor read: %s)", num_ports, esp_err_to_name(herr));
+
+            // Power OFF all ports
+            for (uint8_t p = 1; p <= num_ports; p++) {
+              herr = ctrl_transfer_sync_(dev,
+                  USB_BM_REQUEST_TYPE_DIR_OUT | USB_BM_REQUEST_TYPE_TYPE_CLASS | USB_BM_REQUEST_TYPE_RECIP_OTHER,
+                  USB_HUB_REQ_CLEAR_FEATURE, USB_HUB_FEAT_PORT_POWER, p, 0, nullptr);
+              BRIDGE_LOG("[hub] Port %d OFF: %s", p, esp_err_to_name(herr));
+            }
+
+            BRIDGE_LOG("[hub] Waiting 2s for power drain...");
+            vTaskDelay(pdMS_TO_TICKS(2000));
+
+            // Power ON all ports
+            for (uint8_t p = 1; p <= num_ports; p++) {
+              herr = ctrl_transfer_sync_(dev,
+                  USB_BM_REQUEST_TYPE_DIR_OUT | USB_BM_REQUEST_TYPE_TYPE_CLASS | USB_BM_REQUEST_TYPE_RECIP_OTHER,
+                  USB_HUB_REQ_SET_FEATURE, USB_HUB_FEAT_PORT_POWER, p, 0, nullptr);
+              BRIDGE_LOG("[hub] Port %d ON: %s", p, esp_err_to_name(herr));
+            }
+
+            usb_host_device_close(client, dev);
+            hub_power_cycle_done_ = true;
+            BRIDGE_LOG("[hub] Power cycle complete — waiting 3s for re-enumeration...");
+            vTaskDelay(pdMS_TO_TICKS(3000));
+            return;
+          }
+          usb_host_device_close(client, dev);
+        }
+        // Devices found but no hub — might be direct-connected devices
+        BRIDGE_LOGW("[hub] No hub found among %d device(s) — skipping power cycle", num_devs);
+        return;
+      }
+    }
+    BRIDGE_LOGW("[hub] No devices found after 5s — hub may not be connected");
+  }
 
   // ── Convert USB string descriptor (UTF-16LE) to ASCII ──────
   static void str_desc_to_ascii_(const usb_str_desc_t *desc, char *out, size_t max_len) {
@@ -426,51 +504,7 @@ class UsbBridgeComponent : public Component {
     xSemaphoreGive(discovery_mutex_);
 
     if (is_hub) {
-      BRIDGE_LOG("  Hub detected at addr=%d — power-cycling ports...", dev_addr);
-      hub_addr_ = dev_addr;
-
-      // Read hub descriptor to learn number of ports
-      uint8_t hub_desc_buf[16] = {};
-      esp_err_t herr = ctrl_transfer_sync_(dev,
-          USB_BM_REQUEST_TYPE_DIR_IN | USB_BM_REQUEST_TYPE_TYPE_CLASS | USB_BM_REQUEST_TYPE_RECIP_DEVICE,
-          USB_HUB_REQ_GET_DESCRIPTOR, (0x29 << 8) | 0, 0, sizeof(hub_desc_buf), hub_desc_buf);
-
-      uint8_t num_ports = 4;
-      if (herr == ESP_OK && hub_desc_buf[0] >= 3) {
-        num_ports = hub_desc_buf[2];
-        BRIDGE_LOG("  Hub has %d downstream ports", num_ports);
-      } else {
-        BRIDGE_LOGW("  Hub descriptor read failed (%s), assuming %d ports", esp_err_to_name(herr), num_ports);
-      }
-      hub_num_ports_ = num_ports;
-
-      // Only do power cycle on first boot (not on re-enumeration after our own cycle)
-      if (!hub_power_cycle_done_) {
-        hub_power_cycle_done_ = true;
-        BRIDGE_LOG("  Power-cycling %d hub ports...", num_ports);
-
-        // Power OFF all ports
-        for (uint8_t port = 1; port <= num_ports; port++) {
-          herr = ctrl_transfer_sync_(dev,
-              USB_BM_REQUEST_TYPE_DIR_OUT | USB_BM_REQUEST_TYPE_TYPE_CLASS | USB_BM_REQUEST_TYPE_RECIP_OTHER,
-              USB_HUB_REQ_CLEAR_FEATURE, USB_HUB_FEAT_PORT_POWER, port, 0, nullptr);
-          BRIDGE_LOG("  Port %d power OFF: %s", port, esp_err_to_name(herr));
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(2000));
-
-        // Power ON all ports
-        for (uint8_t port = 1; port <= num_ports; port++) {
-          herr = ctrl_transfer_sync_(dev,
-              USB_BM_REQUEST_TYPE_DIR_OUT | USB_BM_REQUEST_TYPE_TYPE_CLASS | USB_BM_REQUEST_TYPE_RECIP_OTHER,
-              USB_HUB_REQ_SET_FEATURE, USB_HUB_FEAT_PORT_POWER, port, 0, nullptr);
-          BRIDGE_LOG("  Port %d power ON: %s", port, esp_err_to_name(herr));
-        }
-        BRIDGE_LOG("  Hub port power cycle complete — devices will re-enumerate");
-      } else {
-        BRIDGE_LOG("  Hub already power-cycled, skipping");
-      }
-
+      BRIDGE_LOG("  Hub at addr=%d — handled by ESP-IDF driver, skipping");
       usb_host_device_close(client_hdl_, dev);
       return;
     }
@@ -585,10 +619,11 @@ class UsbBridgeComponent : public Component {
     xSemaphoreGive(self->ctrl_xfer_done_);
   }
 
+  // Single unified control transfer function (IN or OUT based on bmRequestType)
   esp_err_t ctrl_transfer_sync_(usb_device_handle_t dev,
                                  uint8_t bmRequestType, uint8_t bRequest,
                                  uint16_t wValue, uint16_t wIndex,
-                                 uint16_t wLength, uint8_t *data_out = nullptr) {
+                                 uint16_t wLength, uint8_t *data = nullptr) {
     usb_transfer_t *xfer;
     size_t alloc_size = sizeof(usb_setup_packet_t) + wLength;
     esp_err_t err = usb_host_transfer_alloc(alloc_size, 0, &xfer);
@@ -601,71 +636,63 @@ class UsbBridgeComponent : public Component {
     setup->wIndex = wIndex;
     setup->wLength = wLength;
 
+    // Copy OUT data after setup packet
+    bool is_in = (bmRequestType & USB_BM_REQUEST_TYPE_DIR_IN);
+    if (!is_in && wLength > 0 && data)
+      memcpy(xfer->data_buffer + sizeof(usb_setup_packet_t), data, wLength);
+
     xfer->device_handle = dev;
     xfer->bEndpointAddress = 0;
     xfer->callback = ctrl_xfer_sync_cb_;
     xfer->context = this;
     xfer->num_bytes = sizeof(usb_setup_packet_t) + wLength;
-    xfer->timeout_ms = 2000;
+    xfer->timeout_ms = 1000;
 
+    // Clear stale semaphore, give lib task a chance to process
     xSemaphoreTake(ctrl_xfer_done_, 0);
-    err = usb_host_transfer_submit_control(client_hdl_, xfer);
-    if (err != ESP_OK) { usb_host_transfer_free(xfer); return err; }
+    vTaskDelay(pdMS_TO_TICKS(5));
 
-    if (xSemaphoreTake(ctrl_xfer_done_, pdMS_TO_TICKS(3000)) != pdTRUE) {
-      usb_host_transfer_free(xfer); return ESP_ERR_TIMEOUT;
+    err = usb_host_transfer_submit_control(client_hdl_, xfer);
+    if (err != ESP_OK) {
+      usb_host_transfer_free(xfer);
+      return err;
     }
+
+    // Wait for callback — the USB transfer timeout (1000ms) will trigger
+    // the callback with TIMEOUT status if device doesn't respond.
+    // We wait slightly longer (1500ms) to ensure callback fires.
+    if (xSemaphoreTake(ctrl_xfer_done_, pdMS_TO_TICKS(1500)) != pdTRUE) {
+      // Callback never fired — transfer still pending.
+      // We CANNOT free it safely. Log and return error.
+      // The transfer will eventually complete/timeout and free itself
+      // via the callback (which just gives the semaphore).
+      BRIDGE_LOGW("ctrl_transfer TIMEOUT (no callback) req=0x%02X val=0x%04X", bRequest, wValue);
+      return ESP_ERR_TIMEOUT;
+    }
+
     if (ctrl_xfer_status_ != USB_TRANSFER_STATUS_COMPLETED) {
-      usb_host_transfer_free(xfer); return ESP_FAIL;
+      usb_host_transfer_free(xfer);
+      return ESP_FAIL;
     }
-    if ((bmRequestType & USB_BM_REQUEST_TYPE_DIR_IN) && data_out && wLength > 0) {
+
+    // Copy IN data
+    if (is_in && data && wLength > 0) {
       size_t copy_len = ctrl_xfer_actual_ > sizeof(usb_setup_packet_t)
                         ? ctrl_xfer_actual_ - sizeof(usb_setup_packet_t) : 0;
       if (copy_len > wLength) copy_len = wLength;
-      memcpy(data_out, xfer->data_buffer + sizeof(usb_setup_packet_t), copy_len);
+      memcpy(data, xfer->data_buffer + sizeof(usb_setup_packet_t), copy_len);
     }
     usb_host_transfer_free(xfer);
     return ESP_OK;
   }
 
+  // Convenience wrapper for OUT transfers
   esp_err_t ctrl_transfer_sync_out_(usb_device_handle_t dev,
                                  uint8_t bmRequestType, uint8_t bRequest,
                                  uint16_t wValue, uint16_t wIndex,
                                  uint16_t wLength, const uint8_t *data_in = nullptr) {
-    usb_transfer_t *xfer;
-    size_t alloc_size = sizeof(usb_setup_packet_t) + wLength;
-    esp_err_t err = usb_host_transfer_alloc(alloc_size, 0, &xfer);
-    if (err != ESP_OK) return err;
-
-    usb_setup_packet_t *setup = (usb_setup_packet_t *)xfer->data_buffer;
-    setup->bmRequestType = bmRequestType;
-    setup->bRequest = bRequest;
-    setup->wValue = wValue;
-    setup->wIndex = wIndex;
-    setup->wLength = wLength;
-
-    if (wLength > 0 && data_in)
-      memcpy(xfer->data_buffer + sizeof(usb_setup_packet_t), data_in, wLength);
-
-    xfer->device_handle = dev;
-    xfer->bEndpointAddress = 0;
-    xfer->callback = ctrl_xfer_sync_cb_;
-    xfer->context = this;
-    xfer->num_bytes = sizeof(usb_setup_packet_t) + wLength;
-    xfer->timeout_ms = 2000;
-
-    xSemaphoreTake(ctrl_xfer_done_, 0);
-    err = usb_host_transfer_submit_control(client_hdl_, xfer);
-    if (err != ESP_OK) { usb_host_transfer_free(xfer); return err; }
-
-    if (xSemaphoreTake(ctrl_xfer_done_, pdMS_TO_TICKS(3000)) != pdTRUE) {
-      usb_host_transfer_free(xfer); return ESP_ERR_TIMEOUT;
-    }
-    if (ctrl_xfer_status_ != USB_TRANSFER_STATUS_COMPLETED) {
-      usb_host_transfer_free(xfer); return ESP_FAIL;
-    }
-    usb_host_transfer_free(xfer);
-    return ESP_OK;
+    return ctrl_transfer_sync_(dev, bmRequestType, bRequest, wValue, wIndex,
+                               wLength, const_cast<uint8_t*>(data_in));
   }
 
   // ── Detect chip type ──────────────────────────────────────
