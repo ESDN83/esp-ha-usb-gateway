@@ -15,6 +15,7 @@
 #include "lwip/netdb.h"
 #include "esp_netif.h"
 #include "esp_system.h"
+#include "esp_ota_ops.h"
 
 #include <atomic>
 #include <cstring>
@@ -217,6 +218,14 @@ class UsbBridgeComponent : public Component {
 #else
     BRIDGE_LOGW("SDKCONFIG: ENUM_FILTER_CALLBACK disabled");
 #endif
+    // Avoid ESP32 OTA rollback during rapid reboot test cycles.
+    // If rollback isn't pending, ESP_ERR_INVALID_STATE is expected and harmless.
+    esp_err_t ota_mark = esp_ota_mark_app_valid_cancel_rollback();
+    if (ota_mark == ESP_OK) {
+      BRIDGE_LOG("OTA app marked valid");
+    } else {
+      BRIDGE_LOG("OTA mark valid skipped: %s", esp_err_to_name(ota_mark));
+    }
 
     discovery_mutex_ = xSemaphoreCreateMutex();
     instance_ = this;
@@ -227,9 +236,7 @@ class UsbBridgeComponent : public Component {
     // Drive D+/D- LOW to force hub to detect disconnect.
     // This ensures devices are re-enumerated after ESP32 reboot
     // without needing to physically unplug the hub.
-    BRIDGE_LOG("USB PHY reset prep: wait 500ms after boot...");
-    vTaskDelay(pdMS_TO_TICKS(500));
-    BRIDGE_LOG("USB PHY reset: SE0 on GPIO19/20 for 1500ms...");
+    BRIDGE_LOG("USB PHY reset: SE0 on GPIO19/20 for 100ms...");
     gpio_config_t io_conf = {};
     io_conf.intr_type = GPIO_INTR_DISABLE;
     io_conf.mode = GPIO_MODE_OUTPUT;
@@ -239,12 +246,12 @@ class UsbBridgeComponent : public Component {
     gpio_config(&io_conf);
     gpio_set_level(GPIO_NUM_19, 0);
     gpio_set_level(GPIO_NUM_20, 0);
-    vTaskDelay(pdMS_TO_TICKS(1500));
+    vTaskDelay(pdMS_TO_TICKS(100));
     // Release pins back to USB PHY
     io_conf.mode = GPIO_MODE_INPUT;
     gpio_config(&io_conf);
-    BRIDGE_LOG("PHY reset done, waiting 4s for hub to settle...");
-    vTaskDelay(pdMS_TO_TICKS(4000));
+    BRIDGE_LOG("PHY reset done, waiting 3s for hub to settle...");
+    vTaskDelay(pdMS_TO_TICKS(3000));
 
     // Load saved device configs from NVS (needed before USB install for enum filter)
     load_nvs_config_();
