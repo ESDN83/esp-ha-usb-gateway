@@ -17,6 +17,8 @@ static const char *const WEB_TAG = "usb_web";
 // ── NVS Storage ─────────────────────────────────────────────
 static constexpr const char *NVS_NAMESPACE = "usb_bridge";
 static constexpr const char *NVS_KEY_COUNT = "dev_count";
+static constexpr const char *NVS_KEY_VERSION = "cfg_ver";
+static constexpr uint8_t NVS_CFG_VERSION = 2;  // v2: added serial field
 static constexpr size_t MAX_DEVICES = 8;
 
 struct StoredDeviceConfig {
@@ -27,12 +29,29 @@ struct StoredDeviceConfig {
   uint32_t baud_rate;
   uint8_t interface;
   uint8_t autoboot;
-  uint8_t _pad[2];
+  char serial[64];
 };
 
 static bool nvs_load_devices(std::vector<StoredDeviceConfig> &out) {
   nvs_handle_t h;
   if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) return false;
+
+  // Check config version
+  uint8_t version = 0;
+  nvs_get_u8(h, NVS_KEY_VERSION, &version);
+  if (version != NVS_CFG_VERSION) {
+    ESP_LOGW(WEB_TAG, "NVS config version mismatch (%d != %d), clearing", version, NVS_CFG_VERSION);
+    nvs_close(h);
+    // Erase old config
+    nvs_handle_t hw;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &hw) == ESP_OK) {
+      nvs_erase_all(hw);
+      nvs_commit(hw);
+      nvs_close(hw);
+    }
+    return false;
+  }
+
   uint8_t count = 0;
   nvs_get_u8(h, NVS_KEY_COUNT, &count);
   out.clear();
@@ -50,21 +69,24 @@ static bool nvs_load_devices(std::vector<StoredDeviceConfig> &out) {
 static bool nvs_save_devices(const std::vector<StoredDeviceConfig> &devs) {
   nvs_handle_t h;
   if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return false;
+  // Erase old entries
   uint8_t old_count = 0;
   nvs_get_u8(h, NVS_KEY_COUNT, &old_count);
   for (uint8_t i = 0; i < old_count; i++) {
     char key[8]; snprintf(key, sizeof(key), "dev%d", i);
     nvs_erase_key(h, key);
   }
+  // Write new
   uint8_t count = devs.size() < MAX_DEVICES ? devs.size() : MAX_DEVICES;
   nvs_set_u8(h, NVS_KEY_COUNT, count);
+  nvs_set_u8(h, NVS_KEY_VERSION, NVS_CFG_VERSION);
   for (uint8_t i = 0; i < count; i++) {
     char key[8]; snprintf(key, sizeof(key), "dev%d", i);
     nvs_set_blob(h, key, &devs[i], sizeof(StoredDeviceConfig));
   }
   nvs_commit(h);
   nvs_close(h);
-  ESP_LOGI(WEB_TAG, "Saved %d device configs to NVS", count);
+  ESP_LOGI(WEB_TAG, "Saved %d device configs to NVS (v%d)", count, NVS_CFG_VERSION);
   return true;
 }
 
@@ -147,6 +169,8 @@ input:focus{border-color:#4fc3f7;outline:none}
 .chk input{width:auto}
 .dev-info{font-size:.82em;color:#aaa;margin-bottom:6px}
 .empty{text-align:center;color:#666;padding:24px;font-size:.9em}
+#logbox{background:#0a0e1a;border:1px solid #2a3a5e;border-radius:6px;padding:10px;font-family:monospace;font-size:.75em;color:#8f8;white-space:pre-wrap;word-break:break-all;max-height:300px;overflow-y:auto;margin-bottom:10px}
+.chip-badge{font-size:.7em;padding:1px 6px;border-radius:8px;background:#2a3a5e;color:#90caf9;margin-left:6px}
 </style>
 </head><body>
 <h1>USB TCP Gateway</h1>
@@ -159,14 +183,22 @@ input:focus{border-color:#4fc3f7;outline:none}
 <div id="configured"><div class="empty">No devices configured yet. Use the + button on a detected device above.</div></div>
 
 <div class="toolbar">
-<button class="btn btn-secondary" onclick="loadAll()">Refresh</button>
+<button class="btn btn-secondary" onclick="refreshStatus()">Refresh</button>
 <button class="btn btn-primary" onclick="saveConfig()">Save &amp; Reboot</button>
+</div>
+
+<h2>Debug Log</h2>
+<div id="logbox">Loading...</div>
+<div class="toolbar">
+<button class="btn btn-secondary" onclick="loadLog()">Refresh Log</button>
 </div>
 
 <div id="toast" class="toast"></div>
 <script>
 let configs=[];
+let savedConfigs=[];
 let discovered=[];
+let dirty=false;
 const BAUDS=[9600,19200,38400,57600,115200,230400,460800,921600];
 
 function toast(msg,err){
@@ -177,10 +209,10 @@ function toast(msg,err){
 function hex4(v){return(v||0).toString(16).toUpperCase().padStart(4,'0')}
 function esc(s){return(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 
-function chipName(vid){
-  if(vid===0x0403)return'FTDI';if(vid===0x10C4)return'CP210X';
-  if(vid===0x1A86)return'CH340';if(vid===0x2341)return'Arduino';
-  return'USB Serial';
+function isAssigned(d){
+  if(d.assigned) return true;
+  return configs.some(c=>c.vid===d.vid&&c.pid===d.pid&&
+    (!c.serial||!d.serial||c.serial===d.serial));
 }
 
 function renderDiscovered(){
@@ -189,14 +221,15 @@ function renderDiscovered(){
   if(!devs.length){c.innerHTML='<div class="empty">No USB serial devices detected. Plug devices into the powered hub.</div>';return;}
   c.innerHTML='';
   devs.forEach(d=>{
-    const assigned=d.assigned||configs.some(c=>c.vid===d.vid&&c.pid===d.pid);
+    const assigned=isAssigned(d);
     const st=assigned?'<span class="status on">Assigned</span>':'<span class="status avail">Available</span>';
-    const name=d.product||chipName(d.vid);
-    const mfr=d.manufacturer?d.manufacturer+' &middot; ':'';
+    const name=d.product||('USB Device '+hex4(d.vid)+':'+hex4(d.pid));
+    const mfr=d.manufacturer||'';
+    const sn=d.serial?' &middot; S/N: '+esc(d.serial):'';
     c.innerHTML+=`<div class="card discovered">
-      <strong>${esc(name)}</strong> ${st}
-      <div class="dev-info">${esc(mfr)}VID: ${hex4(d.vid)} &middot; PID: ${hex4(d.pid)} &middot; Intf: ${d.interfaces||1}${d.serial?' &middot; S/N: '+esc(d.serial):''}</div>
-      ${assigned?'':'<button class="btn btn-add" onclick="addFromDevice('+d.vid+','+d.pid+',\''+esc(name)+'\')">+ Configure</button>'}
+      <strong>${esc(name)}</strong> ${mfr?'<span class="chip-badge">'+esc(mfr)+'</span>':''} ${st}
+      <div class="dev-info">VID: ${hex4(d.vid)} &middot; PID: ${hex4(d.pid)} &middot; Addr: ${d.addr} &middot; Intf: ${d.interfaces||1}${sn}</div>
+      ${assigned?'':'<button class="btn btn-add" onclick=\'addFromDevice('+d.vid+','+d.pid+','+JSON.stringify(name)+','+JSON.stringify(d.serial||"")+','+d.interfaces+')\'>+ Configure</button>'}
     </div>`;
   });
 }
@@ -207,64 +240,116 @@ function renderConfigs(){
   c.innerHTML='';
   configs.forEach((d,i)=>{
     const conn=d._connected||false;
+    const chip=d._chip||'';
     const cls=conn?'connected':'disconnected';
     const st=conn?'<span class="status on">Connected</span>':'<span class="status off">Offline</span>';
     c.innerHTML+=`<div class="card ${cls}">
-      <input class="name-input" value="${esc(d.name)}" onchange="configs[${i}].name=this.value" placeholder="Device name">
-      ${st}
-      <div class="dev-info">VID: ${hex4(d.vid)} &middot; PID: ${hex4(d.pid)} &middot; ${chipName(d.vid)}</div>
+      <input class="name-input" value="${esc(d.name)}" onchange="configs[${i}].name=this.value;dirty=true" placeholder="Device name">
+      ${chip?'<span class="chip-badge">'+esc(chip)+'</span>':''} ${st}
+      <div class="dev-info">VID: ${hex4(d.vid)} &middot; PID: ${hex4(d.pid)}${d.serial?' &middot; S/N: '+esc(d.serial):''}</div>
       <div class="row">
-        <div><label>TCP Port</label><input type="number" value="${d.port}" onchange="configs[${i}].port=parseInt(this.value)||8880" min="1024" max="65535"></div>
-        <div><label>Baud Rate</label><select onchange="configs[${i}].baud_rate=parseInt(this.value)">
+        <div><label>TCP Port</label><input type="number" value="${d.port}" onchange="configs[${i}].port=parseInt(this.value)||8880;dirty=true" min="1024" max="65535"></div>
+        <div><label>Baud Rate</label><select onchange="configs[${i}].baud_rate=parseInt(this.value);dirty=true">
           ${BAUDS.map(b=>`<option value="${b}"${b===d.baud_rate?' selected':''}>${b}</option>`).join('')}
         </select></div>
-        <div><label>Interface</label><input type="number" value="${d.interface||0}" onchange="configs[${i}].interface=parseInt(this.value)||0" min="0" max="10"></div>
-        <div class="chk"><input type="checkbox" id="ab${i}" ${d.autoboot?'checked':''} onchange="configs[${i}].autoboot=this.checked"><label for="ab${i}" style="color:#e0e0e0">Autoboot</label></div>
+        <div><label>Interface</label><input type="number" value="${d.interface||0}" onchange="configs[${i}].interface=parseInt(this.value)||0;dirty=true" min="0" max="10"></div>
+        <div class="chk"><input type="checkbox" id="ab${i}" ${d.autoboot?'checked':''} onchange="configs[${i}].autoboot=this.checked;dirty=true"><label for="ab${i}" style="color:#e0e0e0">Autoboot</label></div>
       </div>
       <div class="actions"><button class="btn btn-danger" onclick="removeConfig(${i})">Remove</button></div>
     </div>`;
   });
 }
 
-function addFromDevice(vid,pid,name){
+function addFromDevice(vid,pid,name,serial,intfCount){
+  if(configs.some(c=>c.vid===vid&&c.pid===pid&&(!serial||c.serial===serial))){
+    toast('Device already configured!',true);return;
+  }
   const next=8880+configs.length;
-  configs.push({name:name||chipName(vid),vid,pid,port:next,baud_rate:115200,interface:0,autoboot:vid===0x10C4});
+  // For CDC-ACM devices with multiple interfaces, default to interface 0
+  // (interface 0 = CDC control, interface 1 = CDC data — we need data interface for bulk endpoints)
+  let defIntf = 0;
+  if(intfCount>1) defIntf=1;  // CDC data interface is usually 1
+  configs.push({name:name||('Device '+hex4(vid)+':'+hex4(pid)),vid,pid,serial:serial||'',port:next,baud_rate:115200,interface:defIntf,autoboot:false});
+  dirty=true;
   renderConfigs();renderDiscovered();
   toast('Device added! Set TCP port and baud rate, then Save & Reboot.');
 }
 
-function removeConfig(i){configs.splice(i,1);renderConfigs();renderDiscovered();}
+function removeConfig(i){configs.splice(i,1);dirty=true;renderConfigs();renderDiscovered();}
 
 function loadAll(){
   Promise.all([
     fetch('/api/usb/config').then(r=>r.json()),
     fetch('/api/usb/status').then(r=>r.json())
   ]).then(([cfg,st])=>{
+    savedConfigs=JSON.parse(JSON.stringify(cfg));
     configs=cfg;
+    dirty=false;
     if(st.configured){
-      st.configured.forEach((s,i)=>{if(configs[i])configs[i]._connected=s.connected;});
+      st.configured.forEach((s,i)=>{
+        if(configs[i]){configs[i]._connected=s.connected;configs[i]._chip=s.chip||'';}
+      });
     }
     discovered=st.discovered||[];
     renderDiscovered();renderConfigs();
   }).catch(e=>toast('Load failed: '+e,true));
 }
 
+function refreshStatus(){
+  fetch('/api/usb/status').then(r=>r.json()).then(st=>{
+    if(st.configured){
+      st.configured.forEach((s,i)=>{
+        if(configs[i]){configs[i]._connected=s.connected;configs[i]._chip=s.chip||'';}
+      });
+    }
+    discovered=st.discovered||[];
+    renderDiscovered();renderConfigs();
+    toast('Refreshed');
+  }).catch(e=>toast('Refresh failed: '+e,true));
+}
+
 function saveConfig(){
-  const body=JSON.stringify(configs.map(d=>({name:d.name,vid:d.vid,pid:d.pid,port:d.port,baud_rate:d.baud_rate,interface:d.interface||0,autoboot:!!d.autoboot})));
+  const body=JSON.stringify(configs.map(d=>({
+    name:d.name,vid:d.vid,pid:d.pid,serial:d.serial||'',
+    port:d.port,baud_rate:d.baud_rate,interface:d.interface||0,autoboot:!!d.autoboot
+  })));
   fetch('/api/usb/config',{method:'POST',headers:{'Content-Type':'application/json'},body})
     .then(r=>{if(!r.ok)throw new Error(r.status);return r.json()})
-    .then(d=>{toast(d.message||'Saved!');setTimeout(()=>location.reload(),10000);})
+    .then(d=>{
+      dirty=false;
+      toast(d.message||'Saved!');
+      setTimeout(()=>location.reload(),10000);
+    })
     .catch(e=>toast('Save failed: '+e,true));
 }
 
+function loadLog(){
+  fetch('/api/usb/log').then(r=>r.text()).then(t=>{
+    const el=document.getElementById('logbox');
+    el.textContent=t||'(empty)';
+    el.scrollTop=el.scrollHeight;
+  }).catch(e=>{document.getElementById('logbox').textContent='Failed: '+e});
+}
+
+// Initial load
 loadAll();
+loadLog();
+
+// Auto-refresh status (don't overwrite local unsaved config changes)
 setInterval(()=>{
   fetch('/api/usb/status').then(r=>r.json()).then(st=>{
-    if(st.configured)st.configured.forEach((s,i)=>{if(configs[i])configs[i]._connected=s.connected;});
+    if(st.configured){
+      st.configured.forEach((s,i)=>{
+        if(configs[i]){configs[i]._connected=s.connected;configs[i]._chip=s.chip||'';}
+      });
+    }
     discovered=st.discovered||[];
     renderDiscovered();renderConfigs();
   }).catch(()=>{});
 },5000);
+
+// Auto-refresh log
+setInterval(loadLog,10000);
 </script>
 </body></html>)rawliteral";
 
@@ -288,11 +373,12 @@ static esp_err_t handle_root_(httpd_req_t *req) {
 static esp_err_t handle_get_config_(httpd_req_t *req);
 static esp_err_t handle_post_config_(httpd_req_t *req);
 static esp_err_t handle_get_status_(httpd_req_t *req);
+static esp_err_t handle_get_log_(httpd_req_t *req);
 
 static httpd_handle_t start_config_webserver_(int port) {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = port;
-  config.max_uri_handlers = 8;
+  config.max_uri_handlers = 10;
   config.stack_size = 8192;
   config.lru_purge_enable = true;
 
@@ -306,11 +392,13 @@ static httpd_handle_t start_config_webserver_(int port) {
   httpd_uri_t get_cfg = {.uri = "/api/usb/config", .method = HTTP_GET, .handler = handle_get_config_, .user_ctx = nullptr};
   httpd_uri_t post_cfg = {.uri = "/api/usb/config", .method = HTTP_POST, .handler = handle_post_config_, .user_ctx = nullptr};
   httpd_uri_t get_st = {.uri = "/api/usb/status", .method = HTTP_GET, .handler = handle_get_status_, .user_ctx = nullptr};
+  httpd_uri_t get_log = {.uri = "/api/usb/log", .method = HTTP_GET, .handler = handle_get_log_, .user_ctx = nullptr};
 
   httpd_register_uri_handler(server, &root);
   httpd_register_uri_handler(server, &get_cfg);
   httpd_register_uri_handler(server, &post_cfg);
   httpd_register_uri_handler(server, &get_st);
+  httpd_register_uri_handler(server, &get_log);
 
   ESP_LOGI(WEB_TAG, "Config UI at http://<ip>:%d/", port);
   return server;

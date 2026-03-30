@@ -23,10 +23,13 @@ via web UI — no YAML device config needed.
 ### Verified USB Devices
 | Device | VID:PID | Chip | Baud | Notes |
 |--------|---------|------|------|-------|
-| SkyConnect v1.0 | 10C4:EA60 | CP210X | 115200 | autoboot=true (no DTR toggle!) |
-| EnOcean USB 300 | 0403:6001 | FTDI FT232 | 57600 | |
-| Sonoff Zigbee 3.0 V2 | 1A86:55D4 | CH9102 | 115200 | CDC-ACM |
+| SkyConnect v1.0 | 10C4:EA60 | CP210X | 115200 | autoboot=true (no DTR toggle!), S/N: 581c7557bf9ced11baa37ffaa7669f5d |
+| Sonoff Zigbee 3.0 V2 | 10C4:EA60 | CP210X | 115200 | **SAME VID:PID as SkyConnect!** S/N: 847a1592b049ef11a799d58cff00cc63 |
+| EnOcean USB 300 | 0403:6001 | FTDI FT232 | 57600 | product string: "USB <-> Serial" |
 | RFLink (Arduino Mega) | 2341:0042 | ATmega16U2 | 57600 | CDC-ACM |
+
+**CRITICAL**: SkyConnect and Sonoff both use CP210X with identical VID:PID (10C4:EA60).
+Serial number matching is REQUIRED to distinguish them.
 
 ## Architecture
 
@@ -121,3 +124,36 @@ The "Root port reset failed" error was caused by:
 - ESP-IDF USB issues: #10086, #12412, #9519, #13933, #17918
 - SLZB-MR5U: ESP32-based USB passthrough with device selection UI
 - HB-RF-ETH-ng: https://github.com/Xerolux/HB-RF-ETH-ng (Vue 3 web UI reference)
+
+
+
+## Bugfix Session 2026-03-30
+
+### User-reported issues (29.03.2026)
+1. Power cycle nach reboot fehlte — Devices nicht erkannt ohne Abstecken
+2. "Assigned" Status sprang zwischen SkyConnect und Sonoff hin und her
+3. Nach Save & Reboot: falsches Device bekam das Mapping
+4. TCP-Verbindung stumm — Zigbee2MQTT konnte Stick nicht ansprechen
+5. Debug-Log im Web-UI fehlte
+6. Refresh-Button ohne Funktion
+
+### Root Causes & Fixes
+1. **PHY Reset zu kurz** — SE0 von 100ms auf 500ms, settle von 2.1s auf 3s
+2. **is_assigned per VID/PID statt USB-Adresse** — jetzt Adress-basiert, kein Verwechseln
+3. **Kein Serial-Number-Matching** — NVS v2 speichert Serial, Matching nutzt VID+PID+Serial
+4. **CDC-ACM fehlte SET_CONTROL_LINE_STATE** — DTR+RTS wurden nicht aktiviert, Stick blieb stumm.
+   Zusätzlich: CDC Default-Interface auf 1 (Data statt Control), auto-fallback auf andere Interfaces
+5. **Ring-Buffer Log (4KB)** — neuer Endpoint `/api/usb/log`, Panel im Web-UI, auto-refresh 10s
+6. **Refresh überschrieb lokale Configs** — Refresh holt jetzt nur Status, nicht Config
+
+### NVS Breaking Change
+- NVS Config Version 1 → 2 (serial field added)
+- Alte v1 configs werden beim ersten Start automatisch gelöscht
+- User muss Devices neu konfigurieren nach diesem Update
+
+### CDC-ACM Init (neu)
+```
+SET_LINE_CODING: baud, 8N1
+SET_CONTROL_LINE_STATE: DTR=1, RTS=1  ← DAS FEHLTE!
+```
+Ohne DTR/RTS aktiviert antworten viele CDC-ACM Chips (CH9102, ATmega16U2) nicht.
