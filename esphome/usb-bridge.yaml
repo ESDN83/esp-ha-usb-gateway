@@ -21,7 +21,7 @@ external_components:
       url: https://github.com/ESDN83/esp-ha-usb-gateway
       ref: master
     components: [usb_bridge]
-    refresh: 1d
+    refresh: 0s
 
 wifi:
   ssid: !secret wifi_ssid

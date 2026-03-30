@@ -26,6 +26,7 @@ namespace esphome {
 namespace usb_bridge {
 
 static const char *const TAG = "usb_bridge";
+static const char *const FW_BUILD_ID = "usb-bridge build 2026-03-31-b";
 
 // Known USB serial chip vendors
 static constexpr uint16_t FTDI_VID = 0x0403;
@@ -210,6 +211,12 @@ class UsbBridgeComponent : public Component {
   void setup() override {
     log_ring_init_();
     BRIDGE_LOG("USB Gateway initializing...");
+    BRIDGE_LOG("%s", FW_BUILD_ID);
+#ifdef CONFIG_USB_HOST_ENABLE_ENUM_FILTER_CALLBACK
+    BRIDGE_LOG("SDKCONFIG: ENUM_FILTER_CALLBACK enabled");
+#else
+    BRIDGE_LOGW("SDKCONFIG: ENUM_FILTER_CALLBACK disabled");
+#endif
 
     discovery_mutex_ = xSemaphoreCreateMutex();
     instance_ = this;
