@@ -220,7 +220,7 @@ class UsbBridgeComponent : public Component {
     // Drive D+/D- LOW to force hub to detect disconnect.
     // This ensures devices are re-enumerated after ESP32 reboot
     // without needing to physically unplug the hub.
-    BRIDGE_LOG("USB PHY reset: SE0 on GPIO19/20 for 500ms...");
+    BRIDGE_LOG("USB PHY reset: SE0 on GPIO19/20 for 100ms...");
     gpio_config_t io_conf = {};
     io_conf.intr_type = GPIO_INTR_DISABLE;
     io_conf.mode = GPIO_MODE_OUTPUT;
@@ -230,7 +230,7 @@ class UsbBridgeComponent : public Component {
     gpio_config(&io_conf);
     gpio_set_level(GPIO_NUM_19, 0);
     gpio_set_level(GPIO_NUM_20, 0);
-    vTaskDelay(pdMS_TO_TICKS(500));
+    vTaskDelay(pdMS_TO_TICKS(100));
     // Release pins back to USB PHY
     io_conf.mode = GPIO_MODE_INPUT;
     gpio_config(&io_conf);
@@ -630,8 +630,11 @@ class UsbBridgeComponent : public Component {
     }
 
     if (!got_it) {
-      BRIDGE_LOGW("ctrl_transfer TIMEOUT req=0x%02X val=0x%04X", bRequest, wValue);
-      // Transfer still pending — cannot safely free it
+      // If callback never arrived, cancel and wait briefly so we can free safely.
+      BRIDGE_LOGW("ctrl_transfer TIMEOUT req=0x%02X val=0x%04X (canceling)", bRequest, wValue);
+      usb_host_transfer_cancel(xfer);
+      xSemaphoreTake(ctrl_xfer_done_, pdMS_TO_TICKS(300));
+      usb_host_transfer_free(xfer);
       return ESP_ERR_TIMEOUT;
     }
 
