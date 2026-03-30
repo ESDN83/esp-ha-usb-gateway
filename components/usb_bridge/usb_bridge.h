@@ -6,6 +6,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
 #include "driver/gpio.h"
 
 #include "usb/usb_host.h"
@@ -81,13 +82,12 @@ static void log_ring_init_() {
 
 static void log_ring_append_(const char *msg) {
   if (!log_ring_mutex_) return;
-  xSemaphoreTake(log_ring_mutex_, portMAX_DELAY);
+  if (xSemaphoreTake(log_ring_mutex_, pdMS_TO_TICKS(50)) != pdTRUE) return;
   size_t len = strlen(msg);
   for (size_t i = 0; i < len; i++) {
     log_ring_[log_ring_head_] = msg[i];
     log_ring_head_ = (log_ring_head_ + 1) % LOG_RING_SIZE;
   }
-  // Add newline
   log_ring_[log_ring_head_] = '\n';
   log_ring_head_ = (log_ring_head_ + 1) % LOG_RING_SIZE;
   xSemaphoreGive(log_ring_mutex_);
@@ -96,7 +96,6 @@ static void log_ring_append_(const char *msg) {
 static size_t log_ring_read_(char *out, size_t max_len) {
   if (!log_ring_mutex_) return 0;
   xSemaphoreTake(log_ring_mutex_, portMAX_DELAY);
-  // Read from oldest to newest
   size_t written = 0;
   size_t pos = log_ring_head_;
   for (size_t i = 0; i < LOG_RING_SIZE && written < max_len - 1; i++) {
@@ -109,25 +108,27 @@ static size_t log_ring_read_(char *out, size_t max_len) {
   return written;
 }
 
+// Log macros: ESP_LOG for ESPHome console + ring buffer for web UI
+// ESP_LOG is called directly (not through snprintf) so ESPHome logger works normally
 #define BRIDGE_LOG(fmt, ...) do { \
-  char _buf[256]; \
-  snprintf(_buf, sizeof(_buf), fmt, ##__VA_ARGS__); \
-  ESP_LOGI(TAG, "%s", _buf); \
-  log_ring_append_(_buf); \
+  ESP_LOGI(TAG, fmt, ##__VA_ARGS__); \
+  char _logbuf[256]; \
+  snprintf(_logbuf, sizeof(_logbuf), fmt, ##__VA_ARGS__); \
+  log_ring_append_(_logbuf); \
 } while(0)
 
 #define BRIDGE_LOGW(fmt, ...) do { \
-  char _buf[256]; \
-  snprintf(_buf, sizeof(_buf), "WARN: " fmt, ##__VA_ARGS__); \
   ESP_LOGW(TAG, fmt, ##__VA_ARGS__); \
-  log_ring_append_(_buf); \
+  char _logbuf[256]; \
+  snprintf(_logbuf, sizeof(_logbuf), "WARN: " fmt, ##__VA_ARGS__); \
+  log_ring_append_(_logbuf); \
 } while(0)
 
 #define BRIDGE_LOGE(fmt, ...) do { \
-  char _buf[256]; \
-  snprintf(_buf, sizeof(_buf), "ERR: " fmt, ##__VA_ARGS__); \
   ESP_LOGE(TAG, fmt, ##__VA_ARGS__); \
-  log_ring_append_(_buf); \
+  char _logbuf[256]; \
+  snprintf(_logbuf, sizeof(_logbuf), "ERR: " fmt, ##__VA_ARGS__); \
+  log_ring_append_(_logbuf); \
 } while(0)
 
 // ── Discovered USB device (detected on bus) ─────────────────
@@ -156,14 +157,6 @@ struct DeviceConfig {
   char serial[64];
 };
 
-// USB Hub class requests (USB 2.0 spec, Table 11-16)
-static constexpr uint8_t USB_HUB_REQ_GET_DESCRIPTOR = 0x06;
-static constexpr uint8_t USB_HUB_REQ_CLEAR_FEATURE = 0x01;
-static constexpr uint8_t USB_HUB_REQ_SET_FEATURE = 0x03;
-// Hub port features
-static constexpr uint16_t USB_HUB_FEAT_PORT_POWER = 8;
-static constexpr uint16_t USB_HUB_FEAT_PORT_RESET = 4;
-
 class UsbBridgeComponent;
 
 struct DeviceConnection {
@@ -184,6 +177,26 @@ struct DeviceConnection {
   SemaphoreHandle_t bulk_in_sem{nullptr};
 };
 
+// ── Enum filter: stored configs for filtering during enumeration ──
+// ESP-IDF enum filter callback is called before EP0 pipe allocation.
+// Rejecting unneeded devices saves precious HCD channels (ESP32-S3 has only 8).
+static std::vector<StoredDeviceConfig> enum_filter_configs_;
+
+static bool enum_filter_cb_(const usb_device_desc_t *dev_desc, uint8_t *bConfigurationValue) {
+  // Always accept hubs (hub driver needs them)
+  if (dev_desc->bDeviceClass == USB_CLASS_HUB) return true;
+
+  // Accept devices whose VID+PID match at least one saved config
+  for (const auto &cfg : enum_filter_configs_) {
+    if (cfg.vid == dev_desc->idVendor && cfg.pid == dev_desc->idProduct) return true;
+  }
+
+  // Reject everything else (saves 1 HCD channel per rejected device)
+  ESP_LOGW(TAG, "Enum filter: rejecting VID=%04X PID=%04X (no matching config)",
+           dev_desc->idVendor, dev_desc->idProduct);
+  return false;
+}
+
 class UsbBridgeComponent : public Component {
  public:
   std::vector<DeviceConnection*>& get_connections() { return connections_; }
@@ -201,8 +214,12 @@ class UsbBridgeComponent : public Component {
     discovery_mutex_ = xSemaphoreCreateMutex();
     instance_ = this;
     ctrl_xfer_done_ = xSemaphoreCreateBinary();
+    new_dev_queue_ = xQueueCreate(8, sizeof(uint8_t));
 
     // ── USB PHY reset ────────────────────────────────────────
+    // Drive D+/D- LOW to force hub to detect disconnect.
+    // This ensures devices are re-enumerated after ESP32 reboot
+    // without needing to physically unplug the hub.
     BRIDGE_LOG("USB PHY reset: SE0 on GPIO19/20 for 500ms...");
     gpio_config_t io_conf = {};
     io_conf.intr_type = GPIO_INTR_DISABLE;
@@ -214,14 +231,32 @@ class UsbBridgeComponent : public Component {
     gpio_set_level(GPIO_NUM_19, 0);
     gpio_set_level(GPIO_NUM_20, 0);
     vTaskDelay(pdMS_TO_TICKS(500));
+    // Release pins back to USB PHY
     io_conf.mode = GPIO_MODE_INPUT;
     gpio_config(&io_conf);
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    BRIDGE_LOG("PHY reset done, waiting 3s for hub to settle...");
+    vTaskDelay(pdMS_TO_TICKS(3000));
+
+    // Load saved device configs from NVS (needed before USB install for enum filter)
+    load_nvs_config_();
+    BRIDGE_LOG("Loaded %zu saved device configs from NVS", connections_.size());
+
+    // Populate enum filter list from NVS configs
+    enum_filter_configs_.clear();
+    for (auto *conn : connections_) {
+      StoredDeviceConfig fc = {};
+      fc.vid = conn->config.vid;
+      fc.pid = conn->config.pid;
+      strncpy(fc.serial, conn->config.serial, sizeof(fc.serial) - 1);
+      enum_filter_configs_.push_back(fc);
+    }
+    BRIDGE_LOG("Enum filter: accepting hubs + %zu configured VID/PID pairs", enum_filter_configs_.size());
 
     // ── Install USB Host + register client ───────────────────
     const usb_host_config_t host_config = {
         .skip_phy_setup = false,
         .intr_flags = ESP_INTR_FLAG_LEVEL1,
+        .enum_filter_cb = enum_filter_cb_,
     };
     esp_err_t err = usb_host_install(&host_config);
     if (err != ESP_OK) {
@@ -245,20 +280,10 @@ class UsbBridgeComponent : public Component {
       return;
     }
 
-    // Load saved device configs from NVS
-    load_nvs_config_();
-    BRIDGE_LOG("Loaded %zu saved device configs from NVS", connections_.size());
-
-    // Start USB lib daemon (processes transfers + hub driver events)
+    // Start USB lib daemon (processes low-level USB/hub events on core 0)
     xTaskCreatePinnedToCore(usb_lib_task_, "usb_lib", 8192, nullptr, 10, nullptr, 0);
 
-    // ── Hub port power cycle ─────────────────────────────────
-    // ESP-IDF hub driver enumerates hubs internally (no client callback).
-    // We poll for the hub device, open it by address, and power-cycle ports.
-    BRIDGE_LOG("Waiting for hub enumeration (polling)...");
-    hub_power_cycle_(client_hdl_);
-
-    // Start monitor task (handles device events from now on)
+    // Start monitor task — processes client events AND the new-device queue
     xTaskCreatePinnedToCore(usb_task_entry_, "usb_mon", 8192, this, 5, nullptr, 1);
 
     // Launch TCP servers for saved configs
@@ -271,6 +296,7 @@ class UsbBridgeComponent : public Component {
     web_ctx_.server = start_config_webserver_(80);
 
     BRIDGE_LOG("USB TCP Gateway ready — config UI at http://<ip>/");
+    BRIDGE_LOG("NOTE: ESP32-S3 has 8 HCD channels. With hub, max 2 serial devices can be active.");
   }
 
   void loop() override {}
@@ -299,80 +325,8 @@ class UsbBridgeComponent : public Component {
   usb_transfer_status_t ctrl_xfer_status_{};
   uint16_t ctrl_xfer_actual_{0};
 
-  // Hub power cycle state
-  uint8_t hub_addr_{0};
-  uint8_t hub_num_ports_{0};
-  bool hub_power_cycle_done_{false};
-
-  // ── Hub port power cycle (called from setup) ──────────────
-  // ESP-IDF hub driver handles hubs internally — no NEW_DEV event for hubs.
-  // We poll usb_host_device_addr_list_fill() to find the hub, open it,
-  // and power-cycle its downstream ports to force device re-enumeration.
-  void hub_power_cycle_(usb_host_client_handle_t client) {
-    // Process events so the hub gets enumerated by the built-in driver
-    for (int i = 0; i < 50; i++) {
-      usb_host_client_handle_events(client, pdMS_TO_TICKS(100));
-
-      // Check if any devices have appeared
-      int num_devs = 0;
-      uint8_t addrs[8] = {};
-      usb_host_device_addr_list_fill(sizeof(addrs) / sizeof(addrs[0]), addrs, &num_devs);
-      if (num_devs > 0) {
-        BRIDGE_LOG("[hub] Found %d device(s) on bus after %dms", num_devs, (i + 1) * 100);
-        // Try each address to find the hub
-        for (int d = 0; d < num_devs; d++) {
-          usb_device_handle_t dev = nullptr;
-          if (usb_host_device_open(client, addrs[d], &dev) != ESP_OK) continue;
-
-          const usb_device_desc_t *desc = nullptr;
-          usb_host_get_device_descriptor(dev, &desc);
-          if (desc && desc->bDeviceClass == USB_CLASS_HUB) {
-            hub_addr_ = addrs[d];
-            BRIDGE_LOG("[hub] Hub found at addr=%d (VID=%04X PID=%04X)", addrs[d], desc->idVendor, desc->idProduct);
-
-            // Read hub descriptor for port count
-            uint8_t hub_desc[16] = {};
-            esp_err_t herr = ctrl_transfer_sync_(dev,
-                USB_BM_REQUEST_TYPE_DIR_IN | USB_BM_REQUEST_TYPE_TYPE_CLASS | USB_BM_REQUEST_TYPE_RECIP_DEVICE,
-                USB_HUB_REQ_GET_DESCRIPTOR, (0x29 << 8), 0, sizeof(hub_desc), hub_desc);
-            uint8_t num_ports = (herr == ESP_OK && hub_desc[0] >= 3) ? hub_desc[2] : 4;
-            hub_num_ports_ = num_ports;
-            BRIDGE_LOG("[hub] Ports: %d (descriptor read: %s)", num_ports, esp_err_to_name(herr));
-
-            // Power OFF all ports
-            for (uint8_t p = 1; p <= num_ports; p++) {
-              herr = ctrl_transfer_sync_(dev,
-                  USB_BM_REQUEST_TYPE_DIR_OUT | USB_BM_REQUEST_TYPE_TYPE_CLASS | USB_BM_REQUEST_TYPE_RECIP_OTHER,
-                  USB_HUB_REQ_CLEAR_FEATURE, USB_HUB_FEAT_PORT_POWER, p, 0, nullptr);
-              BRIDGE_LOG("[hub] Port %d OFF: %s", p, esp_err_to_name(herr));
-            }
-
-            BRIDGE_LOG("[hub] Waiting 2s for power drain...");
-            vTaskDelay(pdMS_TO_TICKS(2000));
-
-            // Power ON all ports
-            for (uint8_t p = 1; p <= num_ports; p++) {
-              herr = ctrl_transfer_sync_(dev,
-                  USB_BM_REQUEST_TYPE_DIR_OUT | USB_BM_REQUEST_TYPE_TYPE_CLASS | USB_BM_REQUEST_TYPE_RECIP_OTHER,
-                  USB_HUB_REQ_SET_FEATURE, USB_HUB_FEAT_PORT_POWER, p, 0, nullptr);
-              BRIDGE_LOG("[hub] Port %d ON: %s", p, esp_err_to_name(herr));
-            }
-
-            usb_host_device_close(client, dev);
-            hub_power_cycle_done_ = true;
-            BRIDGE_LOG("[hub] Power cycle complete — waiting 3s for re-enumeration...");
-            vTaskDelay(pdMS_TO_TICKS(3000));
-            return;
-          }
-          usb_host_device_close(client, dev);
-        }
-        // Devices found but no hub — might be direct-connected devices
-        BRIDGE_LOGW("[hub] No hub found among %d device(s) — skipping power cycle", num_devs);
-        return;
-      }
-    }
-    BRIDGE_LOGW("[hub] No devices found after 5s — hub may not be connected");
-  }
+  // Queue of new device addresses to process (filled by callback, drained by monitor task)
+  QueueHandle_t new_dev_queue_{nullptr};
 
   // ── Convert USB string descriptor (UTF-16LE) to ASCII ──────
   static void str_desc_to_ascii_(const usb_str_desc_t *desc, char *out, size_t max_len) {
@@ -425,16 +379,19 @@ class UsbBridgeComponent : public Component {
   }
 
   // ── USB client event callback ─────────────────────────────
+  // IMPORTANT: Do NOT do heavy work here (no device_open, no ctrl transfers).
+  // Just queue the address for the monitor task to process.
   static void client_event_cb_(const usb_host_client_event_msg_t *event_msg,
                                 void *arg) {
     auto *self = static_cast<UsbBridgeComponent *>(arg);
     switch (event_msg->event) {
-      case USB_HOST_CLIENT_EVENT_NEW_DEV:
-        BRIDGE_LOG(">>> New USB device event (addr=%d)", event_msg->new_dev.address);
-        self->handle_new_device_(event_msg->new_dev.address);
+      case USB_HOST_CLIENT_EVENT_NEW_DEV: {
+        uint8_t addr = event_msg->new_dev.address;
+        xQueueSend(self->new_dev_queue_, &addr, 0);
         break;
+      }
       case USB_HOST_CLIENT_EVENT_DEV_GONE:
-        BRIDGE_LOGW("<<< USB device removed event");
+        // Device removal must be handled here (dev_hdl is only valid in this callback)
         self->close_device_(event_msg->dev_gone.dev_hdl);
         break;
       default:
@@ -444,6 +401,8 @@ class UsbBridgeComponent : public Component {
 
   // ── Handle new device: discover + auto-assign if configured ─
   void handle_new_device_(uint8_t dev_addr) {
+    BRIDGE_LOG(">>> New USB device event (addr=%d)", dev_addr);
+
     usb_device_handle_t dev;
     esp_err_t err = usb_host_device_open(client_hdl_, dev_addr, &dev);
     if (err != ESP_OK) {
@@ -504,7 +463,7 @@ class UsbBridgeComponent : public Component {
     xSemaphoreGive(discovery_mutex_);
 
     if (is_hub) {
-      BRIDGE_LOG("  Hub at addr=%d — handled by ESP-IDF driver, skipping");
+      BRIDGE_LOG("  Hub at addr=%d — handled by ESP-IDF driver, skipping", dev_addr);
       usb_host_device_close(client_hdl_, dev);
       return;
     }
@@ -515,7 +474,6 @@ class UsbBridgeComponent : public Component {
       bool vid_match = (conn->config.vid == desc->idVendor);
       bool pid_match = (conn->config.pid == desc->idProduct);
       bool serial_match = true;
-      // If config has a serial number, require it to match
       if (conn->config.serial[0] != '\0' && dd.serial[0] != '\0') {
         serial_match = (strcmp(conn->config.serial, dd.serial) == 0);
       }
@@ -547,7 +505,6 @@ class UsbBridgeComponent : public Component {
 
     if (!find_bulk_endpoints_(target, config_desc)) {
       BRIDGE_LOGW("  No bulk endpoints on intf %d — trying other interfaces...", target->config.interface);
-      // Try to find bulk endpoints on any interface
       bool found = false;
       for (uint8_t intf = 0; intf < config_desc->bNumInterfaces && !found; intf++) {
         if (intf == target->config.interface) continue;
@@ -568,7 +525,8 @@ class UsbBridgeComponent : public Component {
 
     err = usb_host_interface_claim(client_hdl_, dev, target->claimed_intf, 0);
     if (err != ESP_OK) {
-      BRIDGE_LOGE("  interface_claim(%d) failed: %s", target->claimed_intf, esp_err_to_name(err));
+      BRIDGE_LOGE("  interface_claim(%d) failed: %s (likely 8 HCD channel limit reached)",
+                  target->claimed_intf, esp_err_to_name(err));
       usb_host_device_close(client_hdl_, dev);
       return;
     }
@@ -578,7 +536,8 @@ class UsbBridgeComponent : public Component {
     target->dev_addr = dev_addr;
     xSemaphoreGive(target->usb_mutex);
 
-    // Chip-specific initialization
+    // Chip-specific initialization (control transfers now work because
+    // we're NOT inside the event callback — monitor task pumps events)
     if (target->chip_type == ChipType::FTDI) {
       BRIDGE_LOG("  Initializing FTDI (%d baud)...", target->config.baud_rate);
       ftdi_init_(target);
@@ -612,6 +571,7 @@ class UsbBridgeComponent : public Component {
   }
 
   // ── Synchronous control transfer ──────────────────────────
+  // Pumps client events while waiting so the completion callback can be delivered.
   static void ctrl_xfer_sync_cb_(usb_transfer_t *xfer) {
     auto *self = static_cast<UsbBridgeComponent *>(xfer->context);
     self->ctrl_xfer_status_ = xfer->status;
@@ -619,7 +579,6 @@ class UsbBridgeComponent : public Component {
     xSemaphoreGive(self->ctrl_xfer_done_);
   }
 
-  // Single unified control transfer function (IN or OUT based on bmRequestType)
   esp_err_t ctrl_transfer_sync_(usb_device_handle_t dev,
                                  uint8_t bmRequestType, uint8_t bRequest,
                                  uint16_t wValue, uint16_t wIndex,
@@ -636,7 +595,6 @@ class UsbBridgeComponent : public Component {
     setup->wIndex = wIndex;
     setup->wLength = wLength;
 
-    // Copy OUT data after setup packet
     bool is_in = (bmRequestType & USB_BM_REQUEST_TYPE_DIR_IN);
     if (!is_in && wLength > 0 && data)
       memcpy(xfer->data_buffer + sizeof(usb_setup_packet_t), data, wLength);
@@ -648,9 +606,8 @@ class UsbBridgeComponent : public Component {
     xfer->num_bytes = sizeof(usb_setup_packet_t) + wLength;
     xfer->timeout_ms = 1000;
 
-    // Clear stale semaphore, give lib task a chance to process
+    // Clear any stale semaphore
     xSemaphoreTake(ctrl_xfer_done_, 0);
-    vTaskDelay(pdMS_TO_TICKS(5));
 
     err = usb_host_transfer_submit_control(client_hdl_, xfer);
     if (err != ESP_OK) {
@@ -658,15 +615,23 @@ class UsbBridgeComponent : public Component {
       return err;
     }
 
-    // Wait for callback — the USB transfer timeout (1000ms) will trigger
-    // the callback with TIMEOUT status if device doesn't respond.
-    // We wait slightly longer (1500ms) to ensure callback fires.
-    if (xSemaphoreTake(ctrl_xfer_done_, pdMS_TO_TICKS(1500)) != pdTRUE) {
-      // Callback never fired — transfer still pending.
-      // We CANNOT free it safely. Log and return error.
-      // The transfer will eventually complete/timeout and free itself
-      // via the callback (which just gives the semaphore).
-      BRIDGE_LOGW("ctrl_transfer TIMEOUT (no callback) req=0x%02X val=0x%04X", bRequest, wValue);
+    // Pump client events while waiting for the callback.
+    // The completion callback is delivered via usb_host_client_handle_events(),
+    // so we must keep calling it or the callback never fires.
+    bool got_it = false;
+    TickType_t start = xTaskGetTickCount();
+    while ((xTaskGetTickCount() - start) < pdMS_TO_TICKS(2000)) {
+      if (xSemaphoreTake(ctrl_xfer_done_, 0) == pdTRUE) {
+        got_it = true;
+        break;
+      }
+      // Process client events (delivers transfer callbacks + NEW_DEV events)
+      usb_host_client_handle_events(client_hdl_, pdMS_TO_TICKS(50));
+    }
+
+    if (!got_it) {
+      BRIDGE_LOGW("ctrl_transfer TIMEOUT req=0x%02X val=0x%04X", bRequest, wValue);
+      // Transfer still pending — cannot safely free it
       return ESP_ERR_TIMEOUT;
     }
 
@@ -675,7 +640,6 @@ class UsbBridgeComponent : public Component {
       return ESP_FAIL;
     }
 
-    // Copy IN data
     if (is_in && data && wLength > 0) {
       size_t copy_len = ctrl_xfer_actual_ > sizeof(usb_setup_packet_t)
                         ? ctrl_xfer_actual_ - sizeof(usb_setup_packet_t) : 0;
@@ -794,7 +758,6 @@ class UsbBridgeComponent : public Component {
     BRIDGE_LOG("    FTDI SET_FLOW_CTRL(none): %s", esp_err_to_name(err));
 
     if (!conn->config.autoboot) {
-      // Toggle DTR+RTS for devices that need it
       vc(0x01, 0x0101, conn->config.interface);
       vc(0x01, 0x0202, conn->config.interface);
       BRIDGE_LOG("    FTDI DTR+RTS toggled");
@@ -802,7 +765,6 @@ class UsbBridgeComponent : public Component {
   }
 
   void cdc_acm_init_(DeviceConnection *conn) {
-    // SET_LINE_CODING: baud, stop bits, parity, data bits
     uint8_t data[7];
     uint32_t baud = conn->config.baud_rate;
     memcpy(data, &baud, 4);
@@ -814,7 +776,6 @@ class UsbBridgeComponent : public Component {
         CDC_SET_LINE_CODING, 0, conn->config.interface, 7, data);
     BRIDGE_LOG("    CDC SET_LINE_CODING(%d 8N1): %s", baud, esp_err_to_name(err));
 
-    // SET_CONTROL_LINE_STATE: activate DTR + RTS
     err = ctrl_transfer_sync_out_(conn->dev_hdl,
         USB_BM_REQUEST_TYPE_DIR_OUT | USB_BM_REQUEST_TYPE_TYPE_CLASS | USB_BM_REQUEST_TYPE_RECIP_INTERFACE,
         CDC_SET_CONTROL_LINE_STATE, 0x0003, conn->config.interface, 0, nullptr);
@@ -836,7 +797,6 @@ class UsbBridgeComponent : public Component {
         xSemaphoreGive(conn->usb_mutex);
         conn->chip_type = ChipType::UNKNOWN;
 
-        // Remove from discovery list by address
         xSemaphoreTake(discovery_mutex_, portMAX_DELAY);
         for (auto it = discovered_.begin(); it != discovered_.end(); ) {
           if (it->addr == addr) it = discovered_.erase(it);
@@ -907,12 +867,22 @@ class UsbBridgeComponent : public Component {
   }
 
   // ── USB monitor task ──────────────────────────────────────
+  // Processes client events AND new-device queue.
+  // Device processing happens HERE (not in the callback), so control
+  // transfers can complete via event pumping in ctrl_transfer_sync_().
   static void usb_task_entry_(void *arg) {
     static_cast<UsbBridgeComponent *>(arg)->usb_task_();
   }
   void usb_task_() {
     while (true) {
-      usb_host_client_handle_events(client_hdl_, pdMS_TO_TICKS(1000));
+      // Process pending client events (device connect/disconnect callbacks)
+      usb_host_client_handle_events(client_hdl_, pdMS_TO_TICKS(100));
+
+      // Check for queued new-device addresses
+      uint8_t addr;
+      while (xQueueReceive(new_dev_queue_, &addr, 0) == pdTRUE) {
+        handle_new_device_(addr);
+      }
     }
   }
 
@@ -989,7 +959,6 @@ class UsbBridgeComponent : public Component {
 
         opt = 1;
         lwip_setsockopt(cfd, SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof(opt));
-        // Set TCP_NODELAY for low latency
         lwip_setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
         conn->tcp_client_fd.store(cfd);
 
