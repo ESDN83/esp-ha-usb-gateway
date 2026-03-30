@@ -57,10 +57,6 @@ ota:
 
 # USB Serial <-> TCP Bridge
 # No YAML device config needed!
-# All device configuration is done via web UI at http://<device-ip>:81/
-# Detected USB devices are shown automatically, assign them to TCP ports in the UI.
-#
-# Skip hub-internal CP2102 by USB bcdDevice (decimal 256 = 0x0100). Check device log lines:
-#   bcdUSB=... bcdDevice=...  — hub bridge often 0x0100; if Sonoff matches too, set 0 and use another hub.
+# All device configuration is done via web UI at http://<device-ip>/
+# Detected USB devices are shown automatically; assign TCP ports in the UI.
 usb_bridge:
-  skip_cp210x_bcd_device: 256
