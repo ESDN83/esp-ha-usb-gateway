@@ -37,6 +37,12 @@ wifi:
 logger:
   level: DEBUG
 
+# Reboot tests happen quickly; mark boot as good sooner to avoid OTA rollback
+# when manually rebooting during USB reset verification.
+safe_mode:
+  boot_is_good_after: 5s
+  num_attempts: 20
+
 api:
   encryption:
     key: !secret api_encryption_key
