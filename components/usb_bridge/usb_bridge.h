@@ -27,7 +27,7 @@ namespace esphome {
 namespace usb_bridge {
 
 static const char *const TAG = "usb_bridge";
-static const char *const FW_BUILD_ID = "usb-bridge build 2026-03-31-b";
+static const char *const FW_BUILD_ID = "usb-bridge build 2026-03-31-c";
 
 // Known USB serial chip vendors
 static constexpr uint16_t FTDI_VID = 0x0403;
@@ -184,13 +184,31 @@ struct DeviceConnection {
 // Rejecting unneeded devices saves precious HCD channels (ESP32-S3 has only 8).
 static std::vector<StoredDeviceConfig> enum_filter_configs_;
 
+// Many external hubs use bDeviceClass=0 (per-interface) instead of 0x09. If we reject
+// the hub here, nothing downstream enumerates — looks like "no USB after boot".
+static bool enum_filter_is_likely_hub_(const usb_device_desc_t *d) {
+  if (d->bDeviceClass == USB_CLASS_HUB)
+    return true;
+  // Terminus / generic 4-port hubs (see DEVELOPMENT.md: 1A40:0201)
+  if (d->idVendor == 0x1A40 && (d->idProduct == 0x0201 || d->idProduct == 0x0101))
+    return true;
+  // Genesys Logic hub controllers (very common)
+  if (d->idVendor == 0x05E3 && d->idProduct >= 0x0600 && d->idProduct <= 0x0620)
+    return true;
+  // VIA Labs hub chips
+  if (d->idVendor == 0x2109)
+    return true;
+  return false;
+}
+
 static bool enum_filter_cb_(const usb_device_desc_t *dev_desc, uint8_t *bConfigurationValue) {
-  // Always accept hubs (hub driver needs them)
-  if (dev_desc->bDeviceClass == USB_CLASS_HUB) return true;
+  if (enum_filter_is_likely_hub_(dev_desc))
+    return true;
 
   // Accept devices whose VID+PID match at least one saved config
   for (const auto &cfg : enum_filter_configs_) {
-    if (cfg.vid == dev_desc->idVendor && cfg.pid == dev_desc->idProduct) return true;
+    if (cfg.vid == dev_desc->idVendor && cfg.pid == dev_desc->idProduct)
+      return true;
   }
 
   // Reject everything else (saves 1 HCD channel per rejected device)
