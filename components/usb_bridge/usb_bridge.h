@@ -630,11 +630,9 @@ class UsbBridgeComponent : public Component {
     }
 
     if (!got_it) {
-      // If callback never arrived, cancel and wait briefly so we can free safely.
-      BRIDGE_LOGW("ctrl_transfer TIMEOUT req=0x%02X val=0x%04X (canceling)", bRequest, wValue);
-      usb_host_transfer_cancel(xfer);
-      xSemaphoreTake(ctrl_xfer_done_, pdMS_TO_TICKS(300));
-      usb_host_transfer_free(xfer);
+      // IDF variant in ESPHome does not provide a cancel API for control transfers.
+      // Do not free here to avoid use-after-free if completion arrives later.
+      BRIDGE_LOGW("ctrl_transfer TIMEOUT req=0x%02X val=0x%04X", bRequest, wValue);
       return ESP_ERR_TIMEOUT;
     }
 
