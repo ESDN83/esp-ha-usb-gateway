@@ -25,6 +25,8 @@ async def to_code(config):
 
     # HTTP server for config web UI (port 81)
     add_idf_sdkconfig_option("CONFIG_HTTPD_MAX_REQ_HDR_LEN", 1024)
+    # Default lwIP socket count is low; TCP listeners + httpd + HA polling can hit ENFILE (errno 23) on accept().
+    add_idf_sdkconfig_option("CONFIG_LWIP_MAX_SOCKETS", 20)
 
     # Enable native hub support
     add_idf_sdkconfig_option("CONFIG_USB_HOST_HUBS_SUPPORTED", True)

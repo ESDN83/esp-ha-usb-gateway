@@ -13,6 +13,7 @@ esp32:
     sdkconfig_options:
       CONFIG_USB_OTG_SUPPORTED: "y"
       CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE: "1024"
+      CONFIG_LWIP_MAX_SOCKETS: "20"
 
 # USB Bridge component from GitHub
 external_components:
