@@ -29,6 +29,8 @@ async def to_code(config):
     # Enable native hub support
     add_idf_sdkconfig_option("CONFIG_USB_HOST_HUBS_SUPPORTED", True)
     add_idf_sdkconfig_option("CONFIG_USB_HOST_HUB_MULTI_LEVEL", True)
+    # Required so host_config.enum_filter_cb is actually used by IDF
+    add_idf_sdkconfig_option("CONFIG_USB_HOST_ENABLE_ENUM_FILTER_CALLBACK", True)
 
     # PSRAM can cause USB host interrupts to be missed (ESP-IDF #9519).
     add_idf_sdkconfig_option("CONFIG_SPIRAM", False)

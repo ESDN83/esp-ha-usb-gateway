@@ -220,7 +220,9 @@ class UsbBridgeComponent : public Component {
     // Drive D+/D- LOW to force hub to detect disconnect.
     // This ensures devices are re-enumerated after ESP32 reboot
     // without needing to physically unplug the hub.
-    BRIDGE_LOG("USB PHY reset: SE0 on GPIO19/20 for 100ms...");
+    BRIDGE_LOG("USB PHY reset prep: wait 500ms after boot...");
+    vTaskDelay(pdMS_TO_TICKS(500));
+    BRIDGE_LOG("USB PHY reset: SE0 on GPIO19/20 for 1500ms...");
     gpio_config_t io_conf = {};
     io_conf.intr_type = GPIO_INTR_DISABLE;
     io_conf.mode = GPIO_MODE_OUTPUT;
@@ -230,12 +232,12 @@ class UsbBridgeComponent : public Component {
     gpio_config(&io_conf);
     gpio_set_level(GPIO_NUM_19, 0);
     gpio_set_level(GPIO_NUM_20, 0);
-    vTaskDelay(pdMS_TO_TICKS(100));
+    vTaskDelay(pdMS_TO_TICKS(1500));
     // Release pins back to USB PHY
     io_conf.mode = GPIO_MODE_INPUT;
     gpio_config(&io_conf);
-    BRIDGE_LOG("PHY reset done, waiting 3s for hub to settle...");
-    vTaskDelay(pdMS_TO_TICKS(3000));
+    BRIDGE_LOG("PHY reset done, waiting 4s for hub to settle...");
+    vTaskDelay(pdMS_TO_TICKS(4000));
 
     // Load saved device configs from NVS (needed before USB install for enum filter)
     load_nvs_config_();
