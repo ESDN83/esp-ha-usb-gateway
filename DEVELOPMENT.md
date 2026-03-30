@@ -157,3 +157,90 @@ SET_LINE_CODING: baud, 8N1
 SET_CONTROL_LINE_STATE: DTR=1, RTS=1  ← DAS FEHLTE!
 ```
 Ohne DTR/RTS aktiviert antworten viele CDC-ACM Chips (CH9102, ATmega16U2) nicht.
+
+
+
+### Next Steps (ToDo) — aus den Findings am Ende
+
+#### 1) USB-Geräte nach Reboot ohne Abstecken
+- **Ziel**: Hub + Devices müssen nach ESP-Reboot sicher neu enumerieren.
+- **Fix (bereits umgesetzt/erforderlich)**: **SE0 Reset** auf GPIO19/20 (D-/D+) beim Boot (100ms–500ms) + anschließend settle delay (z.B. 3s), *bevor* `usb_host_install()` läuft.
+- **Wichtig**: Das ist kein “Powercycle” des Hubs, sondern erzwingt für den Hub einen **Disconnect/Reconnect** am Root-Port.
+
+#### 2) Control-Transfer Timeouts (CP210X/FTDI/CDC Init)
+- **Root Cause**: Control-Transfers wurden (oder wurden früher) aus dem USB Client Event Callback heraus gestartet → Deadlock, weil die Completion-Callbacks erst über `usb_host_client_handle_events()` zugestellt werden.
+- **Fix**:
+  - **Event-Callback macht nur Queueing** (addr in Queue), keine `device_open()`/keine Transfers.
+  - **Device-Prozessing in Monitor-Task** (drained queue).
+  - `ctrl_transfer_sync_()` **pumpt client events** während es auf Completion wartet.
+
+#### 3) “Nur das erste Device wird Connected” / `interface_claim(...) = ESP_ERR_NOT_SUPPORTED`
+- **Root Cause**: **ESP32-S3 hat nur 8 USB Host (HCD) Channels**. Bei Hub + mehreren Geräten sind die Channels schnell aufgebraucht.
+  - Hub belegt Channels, jedes enumerierte Device braucht Ressourcen; zusätzlich kommen Bulk-Endpoints pro aktivem Serial-Device dazu.
+- **Praktisches Limit**: Mit typischem USB2-Hub sind meist **max. 2 Serial-Geräte gleichzeitig** realistisch.
+- **Fix (Channel sparen)**:
+  - **Enum-Filter aktivieren**: nur Hubs + Geräte, die in NVS konfiguriert sind (VID/PID) enumerieren lassen.
+  - Dadurch wird z.B. die **interne CP2102 im Hub** (Serial `0001`) gar nicht erst angenommen (spart Channels).
+- **Dokumentation**: Dieses Limit ist “by design” (Hardware/IDF), kein reiner Code-Bug.
+
+#### 4) Debug Log: ESPHome Log + Web UI gleichzeitig
+- **Ziel**: Logs müssen **weiterhin im ESPHome Logger** erscheinen und parallel im Web-UI (Ringbuffer) abrufbar sein (`/api/usb/log`).
+- **Umsetzung**: ESPHome Log über `ESP_LOGI/W/E`, zusätzlich Ringbuffer append.
+
+### User Log (Beispiel) — reproduzierbarer Fehlerfall
+Folgender Log zeigt die 3 zentralen Probleme (CP210X ctrl timeout, Hub-internes CP2102, Channel-Limit bei interface_claim):
+
+USB Gateway initializing...
+USB PHY reset: SE0 on GPIO19/20 for 500ms...
+  Config: Sonoff Zigbee 3.0 USB Dongle Pl VID=10C4 PID=EA60 S/N=847a1592b049ef11a799d58cff00cc63 port=8881 baud=115200
+  Config: USB <-> Serial VID=0403 PID=6001 S/N=(none) port=8882 baud=115200
+  Config: SkyConnect v1.0 VID=10C4 PID=EA60 S/N=581c7557bf9ced11baa37ffaa7669f5d port=8883 baud=115200
+Loaded 3 saved device configs from NVS
+USB TCP Gateway ready — config UI at http://<ip>/
+>>> New USB device event (addr=2)
+Device addr=2: VID=10C4 PID=EA60 Class=00
+  Manufacturer: Nabu Casa
+  Product: SkyConnect v1.0
+  Serial: 581c7557bf9ced11baa37ffaa7669f5d
+  Interfaces: 1, TotalLength: 32
+  Matched config: SkyConnect v1.0 (port=8883)
+  Chip type: CP210X
+  Bulk IN: EP 0x82 (MPS=64), Bulk OUT: EP 0x02, Intf: 0
+  Initializing CP210X (115200 baud, autoboot=1)...
+TCP server listening on port 8882 for USB <-> Serial
+TCP server listening on port 8881 for Sonoff Zigbee 3.0 USB Dongle Pl
+TCP server listening on port 8883 for SkyConnect v1.0
+    CP210X IFC_ENABLE: ESP_ERR_TIMEOUT
+    CP210X SET_MHS (no DTR/RTS toggle): ESP_ERR_TIMEOUT
+    CP210X SET_BAUDRATE(115200): ESP_ERR_TIMEOUT
+=== ASSIGNED SkyConnect v1.0 (VID=10C4 PID=EA60 addr=2) -> TCP port 8883 ===
+Bulk read task started for SkyConnect v1.0 (port 8883)
+>>> New USB device event (addr=3)
+Device addr=3: VID=10C4 PID=EA60 Class=00
+  Manufacturer: Silicon Labs
+  Product: CP2102 USB to UART Bridge Controller
+  Serial: 0001
+  Interfaces: 1, TotalLength: 32
+  No matching config — available in web UI
+>>> New USB device event (addr=4)
+Device addr=4: VID=10C4 PID=EA60 Class=00
+  Manufacturer: Itead
+  Product: Sonoff Zigbee 3.0 USB Dongle Plus V2
+  Serial: 847a1592b049ef11a799d58cff00cc63
+  Interfaces: 1, TotalLength: 32
+  Matched config: Sonoff Zigbee 3.0 USB Dongle Pl (port=8881)
+  Chip type: CP210X
+  Bulk IN: EP 0x82 (MPS=64), Bulk OUT: EP 0x02, Intf: 0
+ERR:   interface_claim(0) failed: ESP_ERR_NOT_SUPPORTED
+>>> New USB device event (addr=5)
+Device addr=5: VID=0403 PID=6001 Class=00
+  Manufacturer: FTDI
+  Product: USB <-> Serial
+  Serial: (none)
+  Interfaces: 1, TotalLength: 32
+  Matched config: USB <-> Serial (port=8882)
+  Chip type: FTDI
+  Bulk IN: EP 0x81 (MPS=64), Bulk OUT: EP 0x02, Intf: 0
+ERR:   interface_claim(0) failed: ESP_ERR_NOT_SUPPORTED
+WARN: Bulk IN submit failed port 8883: ESP_ERR_INVALID_STATE (errors=1)
+Bulk read task ended for SkyConnect v1.0 (rx=0 bytes, errors=1)
