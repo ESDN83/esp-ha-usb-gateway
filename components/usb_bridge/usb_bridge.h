@@ -27,7 +27,7 @@ namespace esphome {
 namespace usb_bridge {
 
 static const char *const TAG = "usb_bridge";
-static const char *const FW_BUILD_ID = "usb-bridge build 2026-03-31-c";
+static const char *const FW_BUILD_ID = "usb-bridge build 2026-03-31-d";
 
 // Known USB serial chip vendors
 static constexpr uint16_t FTDI_VID = 0x0403;
@@ -179,44 +179,6 @@ struct DeviceConnection {
   SemaphoreHandle_t bulk_in_sem{nullptr};
 };
 
-// ── Enum filter: stored configs for filtering during enumeration ──
-// ESP-IDF enum filter callback is called before EP0 pipe allocation.
-// Rejecting unneeded devices saves precious HCD channels (ESP32-S3 has only 8).
-static std::vector<StoredDeviceConfig> enum_filter_configs_;
-
-// Many external hubs use bDeviceClass=0 (per-interface) instead of 0x09. If we reject
-// the hub here, nothing downstream enumerates — looks like "no USB after boot".
-static bool enum_filter_is_likely_hub_(const usb_device_desc_t *d) {
-  if (d->bDeviceClass == USB_CLASS_HUB)
-    return true;
-  // Terminus / generic 4-port hubs (see DEVELOPMENT.md: 1A40:0201)
-  if (d->idVendor == 0x1A40 && (d->idProduct == 0x0201 || d->idProduct == 0x0101))
-    return true;
-  // Genesys Logic hub controllers (very common)
-  if (d->idVendor == 0x05E3 && d->idProduct >= 0x0600 && d->idProduct <= 0x0620)
-    return true;
-  // VIA Labs hub chips
-  if (d->idVendor == 0x2109)
-    return true;
-  return false;
-}
-
-static bool enum_filter_cb_(const usb_device_desc_t *dev_desc, uint8_t *bConfigurationValue) {
-  if (enum_filter_is_likely_hub_(dev_desc))
-    return true;
-
-  // Accept devices whose VID+PID match at least one saved config
-  for (const auto &cfg : enum_filter_configs_) {
-    if (cfg.vid == dev_desc->idVendor && cfg.pid == dev_desc->idProduct)
-      return true;
-  }
-
-  // Reject everything else (saves 1 HCD channel per rejected device)
-  ESP_LOGW(TAG, "Enum filter: rejecting VID=%04X PID=%04X (no matching config)",
-           dev_desc->idVendor, dev_desc->idProduct);
-  return false;
-}
-
 class UsbBridgeComponent : public Component {
  public:
   std::vector<DeviceConnection*>& get_connections() { return connections_; }
@@ -231,11 +193,7 @@ class UsbBridgeComponent : public Component {
     log_ring_init_();
     BRIDGE_LOG("USB Gateway initializing...");
     BRIDGE_LOG("%s", FW_BUILD_ID);
-#ifdef CONFIG_USB_HOST_ENABLE_ENUM_FILTER_CALLBACK
-    BRIDGE_LOG("SDKCONFIG: ENUM_FILTER_CALLBACK enabled");
-#else
-    BRIDGE_LOGW("SDKCONFIG: ENUM_FILTER_CALLBACK disabled");
-#endif
+    BRIDGE_LOG("USB enum filter: disabled (enumerate all; avoids empty discovered if hub VID unknown)");
     // Avoid ESP32 OTA rollback during rapid reboot test cycles.
     // If rollback isn't pending, ESP_ERR_INVALID_STATE is expected and harmless.
     esp_err_t ota_mark = esp_ota_mark_app_valid_cancel_rollback();
@@ -271,26 +229,14 @@ class UsbBridgeComponent : public Component {
     BRIDGE_LOG("PHY reset done, waiting 3s for hub to settle...");
     vTaskDelay(pdMS_TO_TICKS(3000));
 
-    // Load saved device configs from NVS (needed before USB install for enum filter)
     load_nvs_config_();
     BRIDGE_LOG("Loaded %zu saved device configs from NVS", connections_.size());
-
-    // Populate enum filter list from NVS configs
-    enum_filter_configs_.clear();
-    for (auto *conn : connections_) {
-      StoredDeviceConfig fc = {};
-      fc.vid = conn->config.vid;
-      fc.pid = conn->config.pid;
-      strncpy(fc.serial, conn->config.serial, sizeof(fc.serial) - 1);
-      enum_filter_configs_.push_back(fc);
-    }
-    BRIDGE_LOG("Enum filter: accepting hubs + %zu configured VID/PID pairs", enum_filter_configs_.size());
 
     // ── Install USB Host + register client ───────────────────
     const usb_host_config_t host_config = {
         .skip_phy_setup = false,
         .intr_flags = ESP_INTR_FLAG_LEVEL1,
-        .enum_filter_cb = enum_filter_cb_,
+        .enum_filter_cb = nullptr,
     };
     esp_err_t err = usb_host_install(&host_config);
     if (err != ESP_OK) {
