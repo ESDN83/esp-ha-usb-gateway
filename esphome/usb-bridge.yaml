@@ -37,6 +37,7 @@ wifi:
 
 logger:
   level: DEBUG
+  hardware_uart: UART0  # CRITICAL: USB_SERIAL_JTAG (default) blocks GPIO19/20 needed for USB host!
 
 # Reboot tests happen quickly; mark boot as good sooner to avoid OTA rollback
 # when manually rebooting during USB reset verification.
