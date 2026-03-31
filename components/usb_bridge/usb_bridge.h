@@ -28,7 +28,7 @@ namespace esphome {
 namespace usb_bridge {
 
 static const char *const TAG = "usb_bridge";
-static const char *const FW_BUILD_ID = "usb-bridge build 2026-03-31-p";
+static const char *const FW_BUILD_ID = "usb-bridge build 2026-03-31-q";
 
 // Known USB serial chip vendors
 static constexpr uint16_t FTDI_VID = 0x0403;
@@ -180,7 +180,6 @@ struct DeviceConnection {
   SemaphoreHandle_t bulk_in_sem{nullptr};
 };
 
-static usb_phy_handle_t phy_hdl_ = nullptr;
 
 class UsbBridgeComponent : public Component {
  public:
@@ -211,32 +210,39 @@ class UsbBridgeComponent : public Component {
     ctrl_xfer_done_ = xSemaphoreCreateBinary();
     new_dev_queue_ = xQueueCreate(8, sizeof(uint8_t));
 
-    // ── USB PHY: init, force disconnect, then allow reconnect ──
+    // ── USB PHY: force disconnect so hub sees a clean reconnect ──
     // GPIO manipulation doesn't reach the bus on ESP32-S3 (internal PHY).
-    // Use the ESP-IDF USB PHY API to properly signal disconnect to the hub.
-    usb_phy_config_t phy_config = {};
-    phy_config.controller = USB_PHY_CTRL_OTG;
-    phy_config.target = USB_PHY_TARGET_INT;
-    phy_config.otg_mode = USB_OTG_MODE_HOST;
-    phy_config.otg_speed = USB_PHY_SPEED_UNDEFINED;
-    esp_err_t phy_err = usb_new_phy(&phy_config, &phy_hdl_);
-    bool phy_ok = (phy_err == ESP_OK);
-    if (phy_ok) {
-      // Hold hub in disconnected state while we set up the USB host stack
-      BRIDGE_LOG("USB PHY: force disconnect (hold until host stack ready)...");
-      usb_phy_action(phy_hdl_, USB_PHY_ACTION_HOST_FORCE_DISCONN);
-      vTaskDelay(pdMS_TO_TICKS(500));
-    } else {
-      BRIDGE_LOGW("USB PHY init failed: %s — hub reset not available", esp_err_to_name(phy_err));
+    // Use ESP-IDF USB PHY API: create PHY → force disconnect → delete PHY.
+    // Then usb_host_install(skip_phy_setup=false) creates a fresh PHY and
+    // the HCD sees a new connection event → triggers enumeration.
+    {
+      usb_phy_config_t phy_config = {};
+      phy_config.controller = USB_PHY_CTRL_OTG;
+      phy_config.target = USB_PHY_TARGET_INT;
+      phy_config.otg_mode = USB_OTG_MODE_HOST;
+      phy_config.otg_speed = USB_PHY_SPEED_UNDEFINED;
+      usb_phy_handle_t tmp_phy = nullptr;
+      esp_err_t phy_err = usb_new_phy(&phy_config, &tmp_phy);
+      if (phy_err == ESP_OK) {
+        BRIDGE_LOG("USB PHY: force disconnect 500ms...");
+        usb_phy_action(tmp_phy, USB_PHY_ACTION_HOST_FORCE_DISCONN);
+        vTaskDelay(pdMS_TO_TICKS(500));
+        // Delete PHY so usb_host_install() can create its own fresh one
+        usb_del_phy(tmp_phy);
+        BRIDGE_LOG("USB PHY: released — host install will see fresh connection");
+      } else {
+        BRIDGE_LOGW("USB PHY init failed: %s — skipping disconnect", esp_err_to_name(phy_err));
+      }
     }
 
     load_nvs_config_();
     BRIDGE_LOG("Loaded %zu saved device configs from NVS", connections_.size());
 
     // ── Install USB Host + register client ───────────────────
-    // skip_phy_setup=true because we already initialized the PHY above
+    // skip_phy_setup=false: let ESP-IDF create its own PHY and do root port reset.
+    // The hub was disconnected above, so the HCD will see a fresh connect event.
     const usb_host_config_t host_config = {
-        .skip_phy_setup = phy_ok,
+        .skip_phy_setup = false,
         .intr_flags = ESP_INTR_FLAG_LEVEL1,
     };
     esp_err_t err = usb_host_install(&host_config);
@@ -278,12 +284,6 @@ class UsbBridgeComponent : public Component {
 
     BRIDGE_LOG("USB TCP Gateway ready — config UI at http://<ip>/");
     BRIDGE_LOG("NOTE: ESP32-S3 has 8 HCD channels. With hub, max 2 serial devices can be active.");
-
-    // ── NOW release the hub: host stack is ready to receive connect events ──
-    if (phy_ok) {
-      BRIDGE_LOG("USB PHY: releasing hub — allow connection now...");
-      usb_phy_action(phy_hdl_, USB_PHY_ACTION_HOST_ALLOW_CONN);
-    }
   }
 
   void loop() override {}
