@@ -27,7 +27,7 @@ namespace esphome {
 namespace usb_bridge {
 
 static const char *const TAG = "usb_bridge";
-static const char *const FW_BUILD_ID = "usb-bridge build 2026-03-31-t";
+static const char *const FW_BUILD_ID = "usb-bridge build 2026-04-01-a";
 
 // Known USB serial chip vendors
 static constexpr uint16_t FTDI_VID = 0x0403;
@@ -227,17 +227,11 @@ class UsbBridgeComponent : public Component {
     ctrl_xfer_done_ = xSemaphoreCreateBinary();
     new_dev_queue_ = xQueueCreate(8, sizeof(uint8_t));
 
-    // ── Step 1: Force USB disconnect via GPIO BEFORE PHY is initialized ──
-    // GPIO19 (D-) / GPIO20 (D+) are free before usb_host_install().
-    // Driving both LOW = SE0 state = USB disconnect signal.
-    // Two pulses with pause — same pattern that worked in build -k.
-    BRIDGE_LOG("USB bus reset pulse 1: SE0 100ms...");
+    // ── USB PHY reset: exact pattern from last known-good build (-c) ──
+    // Single 100ms SE0 pulse + 3s settle. Do NOT double-pulse.
+    BRIDGE_LOG("USB PHY reset: SE0 on GPIO19/20 for 100ms...");
     usb_force_disconnect_gpio_(100);
-    vTaskDelay(pdMS_TO_TICKS(500));
-    BRIDGE_LOG("USB bus reset pulse 2: SE0 100ms...");
-    usb_force_disconnect_gpio_(100);
-    // Hub needs time to detect disconnect and start re-enumeration
-    BRIDGE_LOG("USB settle: waiting 3s for hub...");
+    BRIDGE_LOG("PHY reset done, waiting 3s for hub to settle...");
     vTaskDelay(pdMS_TO_TICKS(3000));
 
     load_nvs_config_();
