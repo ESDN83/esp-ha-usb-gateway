@@ -348,10 +348,16 @@ class UsbBridgeComponent : public Component {
 
   // ── USB Host Library daemon ───────────────────────────────
   static void usb_lib_task_(void *arg) {
+    BRIDGE_LOG("[usb_lib] task started on core %d", xPortGetCoreID());
     while (true) {
       uint32_t event_flags = 0;
-      esp_err_t err = usb_host_lib_handle_events(portMAX_DELAY, &event_flags);
-      if (err != ESP_OK) {
+      esp_err_t err = usb_host_lib_handle_events(pdMS_TO_TICKS(5000), &event_flags);
+      if (err == ESP_OK && event_flags != 0) {
+        BRIDGE_LOG("[usb_lib] event_flags=0x%lx", (unsigned long)event_flags);
+      } else if (err == ESP_ERR_TIMEOUT) {
+        BRIDGE_LOG("[usb_lib] no events for 5s (waiting...)");
+      } else if (err != ESP_OK) {
+        BRIDGE_LOGW("[usb_lib] handle_events error: %s", esp_err_to_name(err));
         vTaskDelay(pdMS_TO_TICKS(100));
       }
     }
