@@ -28,7 +28,7 @@ namespace esphome {
 namespace usb_bridge {
 
 static const char *const TAG = "usb_bridge";
-static const char *const FW_BUILD_ID = "usb-bridge build 2026-03-31-n";
+static const char *const FW_BUILD_ID = "usb-bridge build 2026-03-31-p";
 
 // Known USB serial chip vendors
 static constexpr uint16_t FTDI_VID = 0x0403;
@@ -220,16 +220,14 @@ class UsbBridgeComponent : public Component {
     phy_config.otg_mode = USB_OTG_MODE_HOST;
     phy_config.otg_speed = USB_PHY_SPEED_UNDEFINED;
     esp_err_t phy_err = usb_new_phy(&phy_config, &phy_hdl_);
-    if (phy_err == ESP_OK) {
-      BRIDGE_LOG("USB PHY: force disconnect 500ms...");
+    bool phy_ok = (phy_err == ESP_OK);
+    if (phy_ok) {
+      // Hold hub in disconnected state while we set up the USB host stack
+      BRIDGE_LOG("USB PHY: force disconnect (hold until host stack ready)...");
       usb_phy_action(phy_hdl_, USB_PHY_ACTION_HOST_FORCE_DISCONN);
       vTaskDelay(pdMS_TO_TICKS(500));
-      BRIDGE_LOG("USB PHY: allow connection, waiting 3s for hub...");
-      usb_phy_action(phy_hdl_, USB_PHY_ACTION_HOST_ALLOW_CONN);
-      vTaskDelay(pdMS_TO_TICKS(3000));
     } else {
-      BRIDGE_LOGW("USB PHY init failed: %s — falling back to delay", esp_err_to_name(phy_err));
-      vTaskDelay(pdMS_TO_TICKS(3000));
+      BRIDGE_LOGW("USB PHY init failed: %s — hub reset not available", esp_err_to_name(phy_err));
     }
 
     load_nvs_config_();
@@ -238,7 +236,7 @@ class UsbBridgeComponent : public Component {
     // ── Install USB Host + register client ───────────────────
     // skip_phy_setup=true because we already initialized the PHY above
     const usb_host_config_t host_config = {
-        .skip_phy_setup = true,
+        .skip_phy_setup = phy_ok,
         .intr_flags = ESP_INTR_FLAG_LEVEL1,
     };
     esp_err_t err = usb_host_install(&host_config);
@@ -280,6 +278,12 @@ class UsbBridgeComponent : public Component {
 
     BRIDGE_LOG("USB TCP Gateway ready — config UI at http://<ip>/");
     BRIDGE_LOG("NOTE: ESP32-S3 has 8 HCD channels. With hub, max 2 serial devices can be active.");
+
+    // ── NOW release the hub: host stack is ready to receive connect events ──
+    if (phy_ok) {
+      BRIDGE_LOG("USB PHY: releasing hub — allow connection now...");
+      usb_phy_action(phy_hdl_, USB_PHY_ACTION_HOST_ALLOW_CONN);
+    }
   }
 
   void loop() override {}
