@@ -27,7 +27,7 @@ namespace esphome {
 namespace usb_bridge {
 
 static const char *const TAG = "usb_bridge";
-static const char *const FW_BUILD_ID = "usb-bridge build 2026-04-01-a";
+static const char *const FW_BUILD_ID = "usb-bridge build 2026-04-01-b";
 
 // Known USB serial chip vendors
 static constexpr uint16_t FTDI_VID = 0x0403;
@@ -227,17 +227,12 @@ class UsbBridgeComponent : public Component {
     ctrl_xfer_done_ = xSemaphoreCreateBinary();
     new_dev_queue_ = xQueueCreate(8, sizeof(uint8_t));
 
-    // ── USB PHY reset: exact pattern from last known-good build (-c) ──
-    // Single 100ms SE0 pulse + 3s settle. Do NOT double-pulse.
-    BRIDGE_LOG("USB PHY reset: SE0 on GPIO19/20 for 100ms...");
-    usb_force_disconnect_gpio_(100);
-    BRIDGE_LOG("PHY reset done, waiting 3s for hub to settle...");
-    vTaskDelay(pdMS_TO_TICKS(3000));
+    // No GPIO/PHY manipulation — let usb_host_install() handle everything.
+    // Hub re-enumeration after reboot is handled by IDF's own root port reset.
 
     load_nvs_config_();
     BRIDGE_LOG("Loaded %zu saved device configs from NVS", connections_.size());
 
-    // ── Step 2: Install USB Host (creates PHY + HCD, does root port reset) ──
     const usb_host_config_t host_config = {
         .skip_phy_setup = false,
         .intr_flags = ESP_INTR_FLAG_LEVEL1,
@@ -249,9 +244,8 @@ class UsbBridgeComponent : public Component {
       this->mark_failed();
       return;
     }
-    BRIDGE_LOG("USB Host installed");
+    BRIDGE_LOG("USB Host installed (skip_phy=false, no GPIO reset)");
 
-    // ── Step 3: Register client + start tasks ──
     const usb_host_client_config_t client_config = {
         .is_synchronous = false,
         .max_num_event_msg = 10,
@@ -266,7 +260,7 @@ class UsbBridgeComponent : public Component {
       this->mark_failed();
       return;
     }
-    BRIDGE_LOG("USB client registered");
+    BRIDGE_LOG("USB client registered — waiting for devices...");
 
     xTaskCreatePinnedToCore(usb_lib_task_, "usb_lib", 8192, nullptr, 10, nullptr, 0);
     xTaskCreatePinnedToCore(usb_task_entry_, "usb_mon", 8192, this, 5, nullptr, 1);
