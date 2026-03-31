@@ -10,7 +10,6 @@
 #include "driver/gpio.h"
 
 #include "usb/usb_host.h"
-#include "esp_private/usb_phy.h"
 
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
@@ -28,7 +27,7 @@ namespace esphome {
 namespace usb_bridge {
 
 static const char *const TAG = "usb_bridge";
-static const char *const FW_BUILD_ID = "usb-bridge build 2026-03-31-q";
+static const char *const FW_BUILD_ID = "usb-bridge build 2026-03-31-r";
 
 // Known USB serial chip vendors
 static constexpr uint16_t FTDI_VID = 0x0403;
@@ -180,6 +179,24 @@ struct DeviceConnection {
   SemaphoreHandle_t bulk_in_sem{nullptr};
 };
 
+// Drive D+/D- LOW (SE0 = disconnect) via GPIO before USB PHY is initialized.
+// On ESP32-S3 the internal PHY owns GPIO19/20 once usb_host_install() runs,
+// but BEFORE that call the pins are free and GPIO writes DO reach the bus.
+static void usb_force_disconnect_gpio_(int hold_ms) {
+  gpio_config_t io = {};
+  io.intr_type = GPIO_INTR_DISABLE;
+  io.mode = GPIO_MODE_OUTPUT;
+  io.pin_bit_mask = (1ULL << 19) | (1ULL << 20);
+  io.pull_down_en = GPIO_PULLDOWN_DISABLE;
+  io.pull_up_en = GPIO_PULLUP_DISABLE;
+  gpio_config(&io);
+  gpio_set_level(GPIO_NUM_19, 0);
+  gpio_set_level(GPIO_NUM_20, 0);
+  vTaskDelay(pdMS_TO_TICKS(hold_ms));
+  // Release pins back to input — they will float (J-state / idle)
+  io.mode = GPIO_MODE_INPUT;
+  gpio_config(&io);
+}
 
 class UsbBridgeComponent : public Component {
  public:
@@ -210,37 +227,19 @@ class UsbBridgeComponent : public Component {
     ctrl_xfer_done_ = xSemaphoreCreateBinary();
     new_dev_queue_ = xQueueCreate(8, sizeof(uint8_t));
 
-    // ── USB PHY: force disconnect so hub sees a clean reconnect ──
-    // GPIO manipulation doesn't reach the bus on ESP32-S3 (internal PHY).
-    // Use ESP-IDF USB PHY API: create PHY → force disconnect → delete PHY.
-    // Then usb_host_install(skip_phy_setup=false) creates a fresh PHY and
-    // the HCD sees a new connection event → triggers enumeration.
-    {
-      usb_phy_config_t phy_config = {};
-      phy_config.controller = USB_PHY_CTRL_OTG;
-      phy_config.target = USB_PHY_TARGET_INT;
-      phy_config.otg_mode = USB_OTG_MODE_HOST;
-      phy_config.otg_speed = USB_PHY_SPEED_UNDEFINED;
-      usb_phy_handle_t tmp_phy = nullptr;
-      esp_err_t phy_err = usb_new_phy(&phy_config, &tmp_phy);
-      if (phy_err == ESP_OK) {
-        BRIDGE_LOG("USB PHY: force disconnect 500ms...");
-        usb_phy_action(tmp_phy, USB_PHY_ACTION_HOST_FORCE_DISCONN);
-        vTaskDelay(pdMS_TO_TICKS(500));
-        // Delete PHY so usb_host_install() can create its own fresh one
-        usb_del_phy(tmp_phy);
-        BRIDGE_LOG("USB PHY: released — host install will see fresh connection");
-      } else {
-        BRIDGE_LOGW("USB PHY init failed: %s — skipping disconnect", esp_err_to_name(phy_err));
-      }
-    }
+    // ── Step 1: Force USB disconnect via GPIO BEFORE PHY is initialized ──
+    // GPIO19 (D-) / GPIO20 (D+) are free before usb_host_install().
+    // Driving both LOW = SE0 state = USB disconnect signal.
+    // Hub detects SE0 >2.5µs as disconnect; we hold 500ms to be safe.
+    BRIDGE_LOG("USB bus reset: GPIO19/20 LOW (SE0) for 500ms...");
+    usb_force_disconnect_gpio_(500);
+    // Don't wait here — let the hub start reconnecting while we set up the stack.
+    // usb_host_install() will do its own port reset which restarts enumeration.
 
     load_nvs_config_();
     BRIDGE_LOG("Loaded %zu saved device configs from NVS", connections_.size());
 
-    // ── Install USB Host + register client ───────────────────
-    // skip_phy_setup=false: let ESP-IDF create its own PHY and do root port reset.
-    // The hub was disconnected above, so the HCD will see a fresh connect event.
+    // ── Step 2: Install USB Host (creates PHY + HCD, does root port reset) ──
     const usb_host_config_t host_config = {
         .skip_phy_setup = false,
         .intr_flags = ESP_INTR_FLAG_LEVEL1,
@@ -251,7 +250,9 @@ class UsbBridgeComponent : public Component {
       this->mark_failed();
       return;
     }
+    BRIDGE_LOG("USB Host installed");
 
+    // ── Step 3: Register client IMMEDIATELY so we don't miss connect events ──
     const usb_host_client_config_t client_config = {
         .is_synchronous = false,
         .max_num_event_msg = 10,
@@ -266,11 +267,11 @@ class UsbBridgeComponent : public Component {
       this->mark_failed();
       return;
     }
+    BRIDGE_LOG("USB client registered");
 
-    // Start USB lib daemon (processes low-level USB/hub events on core 0)
+    // ── Step 4: Start event processing tasks ──
+    // Must be running before hub enumeration completes so events are handled.
     xTaskCreatePinnedToCore(usb_lib_task_, "usb_lib", 8192, nullptr, 10, nullptr, 0);
-
-    // Start monitor task — processes client events AND the new-device queue
     xTaskCreatePinnedToCore(usb_task_entry_, "usb_mon", 8192, this, 5, nullptr, 1);
 
     // Launch TCP servers for saved configs
