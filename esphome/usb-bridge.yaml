@@ -18,11 +18,9 @@ esp32:
 # USB Bridge component from GitHub
 external_components:
   - source:
-      type: git
-      url: https://github.com/ESDN83/esp-ha-usb-gateway
-      ref: master
+      type: local
+      path: ../components
     components: [usb_bridge]
-    refresh: 0s
 
 wifi:
   ssid: !secret wifi_ssid
