@@ -27,7 +27,7 @@ namespace esphome {
 namespace usb_bridge {
 
 static const char *const TAG = "usb_bridge";
-static const char *const FW_BUILD_ID = "usb-bridge build 2026-03-31-r";
+static const char *const FW_BUILD_ID = "usb-bridge build 2026-03-31-s";
 
 // Known USB serial chip vendors
 static constexpr uint16_t FTDI_VID = 0x0403;
@@ -230,11 +230,15 @@ class UsbBridgeComponent : public Component {
     // ── Step 1: Force USB disconnect via GPIO BEFORE PHY is initialized ──
     // GPIO19 (D-) / GPIO20 (D+) are free before usb_host_install().
     // Driving both LOW = SE0 state = USB disconnect signal.
-    // Hub detects SE0 >2.5µs as disconnect; we hold 500ms to be safe.
-    BRIDGE_LOG("USB bus reset: GPIO19/20 LOW (SE0) for 500ms...");
-    usb_force_disconnect_gpio_(500);
-    // Don't wait here — let the hub start reconnecting while we set up the stack.
-    // usb_host_install() will do its own port reset which restarts enumeration.
+    // Two pulses with pause — same pattern that worked in build -k.
+    BRIDGE_LOG("USB bus reset pulse 1: SE0 100ms...");
+    usb_force_disconnect_gpio_(100);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    BRIDGE_LOG("USB bus reset pulse 2: SE0 100ms...");
+    usb_force_disconnect_gpio_(100);
+    // Hub needs time to detect disconnect and start re-enumeration
+    BRIDGE_LOG("USB settle: waiting 3s for hub...");
+    vTaskDelay(pdMS_TO_TICKS(3000));
 
     load_nvs_config_();
     BRIDGE_LOG("Loaded %zu saved device configs from NVS", connections_.size());
@@ -252,7 +256,7 @@ class UsbBridgeComponent : public Component {
     }
     BRIDGE_LOG("USB Host installed");
 
-    // ── Step 3: Register client IMMEDIATELY so we don't miss connect events ──
+    // ── Step 3: Register client + start tasks ──
     const usb_host_client_config_t client_config = {
         .is_synchronous = false,
         .max_num_event_msg = 10,
@@ -269,8 +273,6 @@ class UsbBridgeComponent : public Component {
     }
     BRIDGE_LOG("USB client registered");
 
-    // ── Step 4: Start event processing tasks ──
-    // Must be running before hub enumeration completes so events are handled.
     xTaskCreatePinnedToCore(usb_lib_task_, "usb_lib", 8192, nullptr, 10, nullptr, 0);
     xTaskCreatePinnedToCore(usb_task_entry_, "usb_mon", 8192, this, 5, nullptr, 1);
 
