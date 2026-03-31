@@ -1,8 +1,6 @@
 #pragma once
 
-#include "esphome/core/application.h"
 #include "esphome/core/component.h"
-#include "esphome/core/hal.h"
 #include "esphome/core/log.h"
 
 #include "freertos/FreeRTOS.h"
@@ -29,7 +27,7 @@ namespace esphome {
 namespace usb_bridge {
 
 static const char *const TAG = "usb_bridge";
-static const char *const FW_BUILD_ID = "usb-bridge build 2026-03-31-i";
+static const char *const FW_BUILD_ID = "usb-bridge build 2026-03-31-j";
 
 // Known USB serial chip vendors
 static constexpr uint16_t FTDI_VID = 0x0403;
@@ -253,16 +251,13 @@ class UsbBridgeComponent : public Component {
     new_dev_queue_ = xQueueCreate(8, sizeof(uint8_t));
 
     // ── USB PHY reset (SE0 on D+/D-): hub sees disconnect, re-enumerates after ESP reboot
-    // Use esphome::delay() instead of vTaskDelay() to feed the WDT during setup()
     BRIDGE_LOG("USB PHY reset pulse 1: SE0 GPIO19/20 100ms...");
     phy_se0_pulse_ms_(100);
-    delay(500);
+    vTaskDelay(pdMS_TO_TICKS(500));
     BRIDGE_LOG("USB PHY reset pulse 2: SE0 GPIO19/20 100ms...");
     phy_se0_pulse_ms_(100);
-    BRIDGE_LOG("PHY settle: waiting 2s for hub + downstream...");
-    delay(1000);
-    App.feed_wdt();
-    delay(1000);
+    BRIDGE_LOG("PHY settle: waiting 3s for hub + downstream...");
+    vTaskDelay(pdMS_TO_TICKS(3000));
 
     load_nvs_config_();
     BRIDGE_LOG("Loaded %zu saved device configs from NVS", connections_.size());
