@@ -10,6 +10,7 @@
 #include "driver/gpio.h"
 
 #include "usb/usb_host.h"
+#include "esp_private/usb_phy.h"
 
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
@@ -27,7 +28,7 @@ namespace esphome {
 namespace usb_bridge {
 
 static const char *const TAG = "usb_bridge";
-static const char *const FW_BUILD_ID = "usb-bridge build 2026-03-31-k";
+static const char *const FW_BUILD_ID = "usb-bridge build 2026-03-31-n";
 
 // Known USB serial chip vendors
 static constexpr uint16_t FTDI_VID = 0x0403;
@@ -179,20 +180,7 @@ struct DeviceConnection {
   SemaphoreHandle_t bulk_in_sem{nullptr};
 };
 
-static void phy_se0_pulse_ms_(int ms) {
-  gpio_config_t io_conf = {};
-  io_conf.intr_type = GPIO_INTR_DISABLE;
-  io_conf.mode = GPIO_MODE_OUTPUT;
-  io_conf.pin_bit_mask = (1ULL << 19) | (1ULL << 20);
-  io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
-  io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
-  gpio_config(&io_conf);
-  gpio_set_level(GPIO_NUM_19, 0);
-  gpio_set_level(GPIO_NUM_20, 0);
-  vTaskDelay(pdMS_TO_TICKS(ms));
-  io_conf.mode = GPIO_MODE_INPUT;
-  gpio_config(&io_conf);
-}
+static usb_phy_handle_t phy_hdl_ = nullptr;
 
 class UsbBridgeComponent : public Component {
  public:
@@ -223,23 +211,35 @@ class UsbBridgeComponent : public Component {
     ctrl_xfer_done_ = xSemaphoreCreateBinary();
     new_dev_queue_ = xQueueCreate(8, sizeof(uint8_t));
 
-    // ── USB PHY reset (SE0 on D+/D-): hub sees disconnect, re-enumerates after ESP reboot
-    BRIDGE_LOG("USB PHY reset pulse 1: SE0 GPIO19/20 100ms...");
-    phy_se0_pulse_ms_(100);
-    vTaskDelay(pdMS_TO_TICKS(500));
-    BRIDGE_LOG("USB PHY reset pulse 2: SE0 GPIO19/20 100ms...");
-    phy_se0_pulse_ms_(100);
-    BRIDGE_LOG("PHY settle: waiting 3s for hub + downstream...");
-    vTaskDelay(pdMS_TO_TICKS(3000));
+    // ── USB PHY: init, force disconnect, then allow reconnect ──
+    // GPIO manipulation doesn't reach the bus on ESP32-S3 (internal PHY).
+    // Use the ESP-IDF USB PHY API to properly signal disconnect to the hub.
+    usb_phy_config_t phy_config = {};
+    phy_config.controller = USB_PHY_CTRL_OTG;
+    phy_config.target = USB_PHY_TARGET_INT;
+    phy_config.otg_mode = USB_OTG_MODE_HOST;
+    phy_config.otg_speed = USB_PHY_SPEED_UNDEFINED;
+    esp_err_t phy_err = usb_new_phy(&phy_config, &phy_hdl_);
+    if (phy_err == ESP_OK) {
+      BRIDGE_LOG("USB PHY: force disconnect 500ms...");
+      usb_phy_action(phy_hdl_, USB_PHY_ACTION_HOST_FORCE_DISCONN);
+      vTaskDelay(pdMS_TO_TICKS(500));
+      BRIDGE_LOG("USB PHY: allow connection, waiting 3s for hub...");
+      usb_phy_action(phy_hdl_, USB_PHY_ACTION_HOST_ALLOW_CONN);
+      vTaskDelay(pdMS_TO_TICKS(3000));
+    } else {
+      BRIDGE_LOGW("USB PHY init failed: %s — falling back to delay", esp_err_to_name(phy_err));
+      vTaskDelay(pdMS_TO_TICKS(3000));
+    }
 
     load_nvs_config_();
     BRIDGE_LOG("Loaded %zu saved device configs from NVS", connections_.size());
 
     // ── Install USB Host + register client ───────────────────
+    // skip_phy_setup=true because we already initialized the PHY above
     const usb_host_config_t host_config = {
-        .skip_phy_setup = false,
+        .skip_phy_setup = true,
         .intr_flags = ESP_INTR_FLAG_LEVEL1,
-        .enum_filter_cb = nullptr,
     };
     esp_err_t err = usb_host_install(&host_config);
     if (err != ESP_OK) {
