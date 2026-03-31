@@ -81,6 +81,7 @@ CONFIG_USB_OTG_SUPPORTED=y
 CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=1024
 CONFIG_USB_HOST_HUBS_SUPPORTED=y
 CONFIG_USB_HOST_HUB_MULTI_LEVEL=y
+CONFIG_USB_HOST_ENABLE_ENUM_FILTER_CALLBACK=y  # Required for enum_filter_cb struct field
 CONFIG_SPIRAM=n                    # PSRAM breaks USB host (IDF #9519)
 CONFIG_ESP32S3_SPIRAM_SUPPORT=n
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024  # For config web UI
@@ -115,6 +116,9 @@ The "Root port reset failed" error was caused by:
 | lwip socket() conflict | Use lwip_socket() etc. directly |
 | ESPHome git cache | Clean Build Files required after changes |
 | PSRAM + USB conflict | Disable PSRAM via sdkconfig |
+| Hub CP2102 exhausts HCD channels | Enum filter rejects 3rd+ CP210x (hub-internal bridge) |
+| ESP offline after update (build-31g) | `CONFIG_USB_HOST_ENABLE_ENUM_FILTER_CALLBACK` was removed but `enum_filter_cb` still referenced → compile error |
+| Serial matching too strict | Restored VID/PID fallback when device reports no serial |
 
 ## GitHub
 - **Repo**: https://github.com/ESDN83/esp-ha-usb-gateway
@@ -162,10 +166,11 @@ Ohne DTR/RTS aktiviert antworten viele CDC-ACM Chips (CH9102, ATmega16U2) nicht.
 
 ### Next Steps (ToDo) — aus den Findings am Ende
 
-#### 1) USB-Geräte nach Reboot ohne Abstecken
+#### 1) USB-Geräte nach Reboot ohne Abstecken ✅
 - **Ziel**: Hub + Devices müssen nach ESP-Reboot sicher neu enumerieren.
-- **Fix (bereits umgesetzt/erforderlich)**: **SE0 Reset** auf GPIO19/20 (D-/D+) beim Boot (100ms–500ms) + anschließend settle delay (z.B. 3s), *bevor* `usb_host_install()` läuft.
+- **Fix**: **SE0 Reset** auf GPIO19/20 (D-/D+) beim Boot: 2× 100ms Pulse mit 500ms Pause + 3s settle, *bevor* `usb_host_install()` läuft.
 - **Wichtig**: Das ist kein “Powercycle” des Hubs, sondern erzwingt für den Hub einen **Disconnect/Reconnect** am Root-Port.
+- **Achtung**: Zu langer settle delay (>5s) kann ESPHome Setup-Watchdog auslösen.
 
 #### 2) Control-Transfer Timeouts (CP210X/FTDI/CDC Init)
 - **Root Cause**: Control-Transfers wurden (oder wurden früher) aus dem USB Client Event Callback heraus gestartet → Deadlock, weil die Completion-Callbacks erst über `usb_host_client_handle_events()` zugestellt werden.
@@ -174,13 +179,12 @@ Ohne DTR/RTS aktiviert antworten viele CDC-ACM Chips (CH9102, ATmega16U2) nicht.
   - **Device-Prozessing in Monitor-Task** (drained queue).
   - `ctrl_transfer_sync_()` **pumpt client events** während es auf Completion wartet.
 
-#### 3) “Nur das erste Device wird Connected” / `interface_claim(...) = ESP_ERR_NOT_SUPPORTED`
+#### 3) “Nur das erste Device wird Connected” / `interface_claim(...) = ESP_ERR_NOT_SUPPORTED` ✅
 - **Root Cause**: **ESP32-S3 hat nur 8 USB Host (HCD) Channels**. Bei Hub + mehreren Geräten sind die Channels schnell aufgebraucht.
   - Hub belegt Channels, jedes enumerierte Device braucht Ressourcen; zusätzlich kommen Bulk-Endpoints pro aktivem Serial-Device dazu.
 - **Praktisches Limit**: Mit typischem USB2-Hub sind meist **max. 2 Serial-Geräte gleichzeitig** realistisch.
-- **Fix (Channel sparen)**:
-  - **Enum-Filter aktivieren**: nur Hubs + Geräte, die in NVS konfiguriert sind (VID/PID) enumerieren lassen.
-  - Dadurch wird z.B. die **interne CP2102 im Hub** (Serial `0001`) gar nicht erst angenommen (spart Channels).
+- **Fix**: `enum_filter_cb_` erlaubt max. 2 CP210x (die echten Sticks) und blockt den 3.+ (Hub-interne CP2102, S/N `0001`). Hubs und alle Nicht-CP210x werden immer durchgelassen.
+- **WICHTIG**: `CONFIG_USB_HOST_ENABLE_ENUM_FILTER_CALLBACK=y` muss in sdkconfig gesetzt sein, sonst existiert das `enum_filter_cb` Feld in `usb_host_config_t` nicht (Compile Error!).
 - **Dokumentation**: Dieses Limit ist “by design” (Hardware/IDF), kein reiner Code-Bug.
 
 #### 4) Debug Log: ESPHome Log + Web UI gleichzeitig

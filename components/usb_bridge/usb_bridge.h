@@ -27,7 +27,7 @@ namespace esphome {
 namespace usb_bridge {
 
 static const char *const TAG = "usb_bridge";
-static const char *const FW_BUILD_ID = "usb-bridge build 2026-03-31-g";
+static const char *const FW_BUILD_ID = "usb-bridge build 2026-03-31-h";
 
 // Known USB serial chip vendors
 static constexpr uint16_t FTDI_VID = 0x0403;
@@ -179,6 +179,33 @@ struct DeviceConnection {
   SemaphoreHandle_t bulk_in_sem{nullptr};
 };
 
+// ── Enum filter: allow hubs + all non-CP210x; reject CP210x with bcdDevice==0
+// Hub-internal CP2102 bridges have bcdDevice=0x0100 and serial "0001", but we
+// can only check the descriptor here (no string descriptors yet).  bcdDevice==0x0100
+// is the default for genuine CP2102, so instead we use a lightweight heuristic:
+// allow the first 2 CP210x (the real sticks) and reject any further ones (hub bridge).
+static int g_cp210x_enum_count_ = 0;
+
+static bool enum_filter_cb_(const usb_device_desc_t *dev_desc, uint8_t *bConfigurationValue) {
+  // Always allow hubs
+  if (dev_desc->bDeviceClass == USB_CLASS_HUB)
+    return true;
+
+  // CP210x: allow first 2, reject extras (hub-internal bridge)
+  if (dev_desc->idVendor == 0x10C4 && dev_desc->idProduct == 0xEA60) {
+    g_cp210x_enum_count_++;
+    if (g_cp210x_enum_count_ > 2) {
+      ESP_LOGW(TAG, "Enum filter: reject CP210x #%d (hub-internal bridge, saves HCD channels)",
+               g_cp210x_enum_count_);
+      return false;
+    }
+    return true;
+  }
+
+  // Allow all other devices
+  return true;
+}
+
 static void phy_se0_pulse_ms_(int ms) {
   gpio_config_t io_conf = {};
   io_conf.intr_type = GPIO_INTR_DISABLE;
@@ -208,7 +235,7 @@ class UsbBridgeComponent : public Component {
     log_ring_init_();
     BRIDGE_LOG("USB Gateway initializing...");
     BRIDGE_LOG("%s", FW_BUILD_ID);
-    BRIDGE_LOG("USB host: enumerate all devices (no enum filter; assignment via web UI + NVS)");
+    BRIDGE_LOG("USB host: enum filter ON (reject 3rd+ CP210x to save HCD channels)");
     // Avoid ESP32 OTA rollback during rapid reboot test cycles.
     // If rollback isn't pending, ESP_ERR_INVALID_STATE is expected and harmless.
     esp_err_t ota_mark = esp_ota_mark_app_valid_cancel_rollback();
@@ -223,28 +250,25 @@ class UsbBridgeComponent : public Component {
     ctrl_xfer_done_ = xSemaphoreCreateBinary();
     new_dev_queue_ = xQueueCreate(8, sizeof(uint8_t));
 
-    // ── USB PHY reset (SE0 on D+/D-): helps hub see disconnect and re-enumerate after ESP reboot
-    BRIDGE_LOG("USB PHY: allow power/VDD stabilize 300ms...");
-    vTaskDelay(pdMS_TO_TICKS(300));
-    for (int i = 1; i <= 3; i++) {
-      BRIDGE_LOG("USB PHY SE0 pulse %d/3: GPIO19/20 LOW %dms...", i, i == 2 ? 150 : 100);
-      phy_se0_pulse_ms_(i == 2 ? 150 : 100);
-      if (i < 3) {
-        BRIDGE_LOG("USB PHY pause 400ms...");
-        vTaskDelay(pdMS_TO_TICKS(400));
-      }
-    }
-    BRIDGE_LOG("PHY settle: waiting 5s for hub + downstream to enumerate...");
-    vTaskDelay(pdMS_TO_TICKS(5000));
+    // ── USB PHY reset (SE0 on D+/D-): hub sees disconnect, re-enumerates after ESP reboot
+    BRIDGE_LOG("USB PHY reset pulse 1: SE0 GPIO19/20 100ms...");
+    phy_se0_pulse_ms_(100);
+    BRIDGE_LOG("USB PHY pause 500ms...");
+    vTaskDelay(pdMS_TO_TICKS(500));
+    BRIDGE_LOG("USB PHY reset pulse 2: SE0 GPIO19/20 100ms...");
+    phy_se0_pulse_ms_(100);
+    BRIDGE_LOG("PHY settle: waiting 3s for hub + downstream...");
+    vTaskDelay(pdMS_TO_TICKS(3000));
 
     load_nvs_config_();
     BRIDGE_LOG("Loaded %zu saved device configs from NVS", connections_.size());
 
     // ── Install USB Host + register client ───────────────────
+    g_cp210x_enum_count_ = 0;
     const usb_host_config_t host_config = {
         .skip_phy_setup = false,
         .intr_flags = ESP_INTR_FLAG_LEVEL1,
-        .enum_filter_cb = nullptr,
+        .enum_filter_cb = enum_filter_cb_,
     };
     esp_err_t err = usb_host_install(&host_config);
     if (err != ESP_OK) {
@@ -465,12 +489,8 @@ class UsbBridgeComponent : public Component {
       bool vid_match = (conn->config.vid == desc->idVendor);
       bool pid_match = (conn->config.pid == desc->idProduct);
       bool serial_match = true;
-      if (conn->config.serial[0] != '\0') {
-        if (dd.serial[0] == '\0') {
-          serial_match = false;
-        } else {
-          serial_match = (strcmp(conn->config.serial, dd.serial) == 0);
-        }
+      if (conn->config.serial[0] != '\0' && dd.serial[0] != '\0') {
+        serial_match = (strcmp(conn->config.serial, dd.serial) == 0);
       }
       if (vid_match && pid_match && serial_match && !conn->connected.load()) {
         target = conn;
