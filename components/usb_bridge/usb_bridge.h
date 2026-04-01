@@ -7,8 +7,6 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "freertos/queue.h"
-#include "driver/gpio.h"
-
 #include "usb/usb_host.h"
 
 #include "lwip/sockets.h"
@@ -27,7 +25,7 @@ namespace esphome {
 namespace usb_bridge {
 
 static const char *const TAG = "usb_bridge";
-static const char *const FW_BUILD_ID = "usb-bridge build 2026-04-01-e";
+static const char *const FW_BUILD_ID = "usb-bridge build 2026-04-01-f";
 
 // Known USB serial chip vendors
 static constexpr uint16_t FTDI_VID = 0x0403;
@@ -189,23 +187,9 @@ static bool enum_filter_allow_all_(const usb_device_desc_t *dev_desc, uint8_t *b
   return true;
 }
 
-// SE0 pulse on D+/D- (GPIO19/20) before USB PHY is initialized.
-// Forces the hub to see a disconnect, so it re-enumerates all downstream
-// devices after ESP reboot.  Must be called BEFORE usb_host_install().
-static void phy_se0_pulse_ms_(int ms) {
-  gpio_config_t io_conf = {};
-  io_conf.intr_type = GPIO_INTR_DISABLE;
-  io_conf.mode = GPIO_MODE_OUTPUT;
-  io_conf.pin_bit_mask = (1ULL << 19) | (1ULL << 20);
-  io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
-  io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
-  gpio_config(&io_conf);
-  gpio_set_level(GPIO_NUM_19, 0);
-  gpio_set_level(GPIO_NUM_20, 0);
-  vTaskDelay(pdMS_TO_TICKS(ms));
-  io_conf.mode = GPIO_MODE_INPUT;
-  gpio_config(&io_conf);
-}
+// GPIO SE0 does NOT work on ESP32-S3 internal PHY — pins are isolated.
+// Instead, we cleanly shut down USB host before reboot so the PHY drops
+// pull-downs, and the hub sees a real disconnect.
 
 class UsbBridgeComponent : public Component {
  public:
@@ -235,24 +219,10 @@ class UsbBridgeComponent : public Component {
     ctrl_xfer_done_ = xSemaphoreCreateBinary();
     new_dev_queue_ = xQueueCreate(8, sizeof(uint8_t));
 
-    // USB reset sequence:
-    // 1. Wait 3s for hub to finish cold-boot (on power cycle, hub starts with ESP)
-    // 2. SE0 pulse: D+/D- LOW = USB disconnect signal (hub drops root port)
-    // 3. IMMEDIATELY run usb_host_install() → PHY pulls D+ HIGH → hub sees
-    //    fresh connect → enumerates all downstream devices
-    // KEY: No gap between SE0 release and PHY init! Floating pins = no valid
-    //    USB state. The hub needs to see SE0→J-state transition cleanly.
-    BRIDGE_LOG("Waiting 3s for USB hub cold-boot init...");
-    vTaskDelay(pdMS_TO_TICKS(3000));
-
-    BRIDGE_LOG("USB SE0 disconnect pulse: GPIO19/20 LOW 200ms...");
-    phy_se0_pulse_ms_(200);
-
-    // Load NVS config while GPIO pins float (minimal delay before PHY init)
     load_nvs_config_();
     BRIDGE_LOG("Loaded %zu saved device configs from NVS", connections_.size());
 
-    // Install USB host IMMEDIATELY after SE0 — PHY pulls D+ HIGH, hub sees connect
+    // Install USB host — IDF handles PHY init and root port reset internally
     const usb_host_config_t host_config = {
         .skip_phy_setup = false,
         .intr_flags = ESP_INTR_FLAG_LEVEL1,
@@ -264,7 +234,7 @@ class UsbBridgeComponent : public Component {
       this->mark_failed();
       return;
     }
-    BRIDGE_LOG("USB Host installed — PHY active, hub should see connect now");
+    BRIDGE_LOG("USB Host installed (PHY active)");
 
     const usb_host_client_config_t client_config = {
         .is_synchronous = false,
@@ -296,13 +266,81 @@ class UsbBridgeComponent : public Component {
     BRIDGE_LOG("NOTE: ESP32-S3 has 8 HCD channels. With hub, max 2 serial devices can be active.");
   }
 
-  void loop() override {}
+  void loop() override {
+    // Cold boot retry: if hub was still booting when we installed USB host,
+    // no devices will be detected. After 10s with 0 devices, reinstall USB stack.
+    if (!cold_boot_retry_done_ && millis() > 10000) {
+      cold_boot_retry_done_ = true;
+      xSemaphoreTake(discovery_mutex_, portMAX_DELAY);
+      size_t dev_count = discovered_.size();
+      xSemaphoreGive(discovery_mutex_);
+      if (dev_count == 0) {
+        BRIDGE_LOGW("No USB devices after 10s — cold boot retry: reinstalling USB host...");
+        // Deregister client
+        if (client_hdl_) {
+          usb_host_client_deregister(client_hdl_);
+          client_hdl_ = nullptr;
+        }
+        uint32_t flags = 0;
+        usb_host_lib_handle_events(pdMS_TO_TICKS(100), &flags);
+        usb_host_uninstall();
+        vTaskDelay(pdMS_TO_TICKS(500));
+        // Reinstall
+        const usb_host_config_t host_config = {
+            .skip_phy_setup = false,
+            .intr_flags = ESP_INTR_FLAG_LEVEL1,
+            .enum_filter_cb = enum_filter_allow_all_,
+        };
+        esp_err_t err = usb_host_install(&host_config);
+        if (err != ESP_OK) {
+          BRIDGE_LOGE("USB Host reinstall failed: %s", esp_err_to_name(err));
+          return;
+        }
+        const usb_host_client_config_t client_config = {
+            .is_synchronous = false,
+            .max_num_event_msg = 10,
+            .async = {
+                .client_event_callback = client_event_cb_,
+                .callback_arg = this,
+            },
+        };
+        err = usb_host_client_register(&client_config, &client_hdl_);
+        if (err != ESP_OK) {
+          BRIDGE_LOGE("USB client re-register failed: %s", esp_err_to_name(err));
+          return;
+        }
+        BRIDGE_LOG("USB host reinstalled — waiting for devices (cold boot retry)");
+      }
+    }
+  }
 
   // Called from web UI to save config and reboot
   bool save_config_and_reboot(const std::vector<StoredDeviceConfig> &devs) {
     if (nvs_save_devices(devs)) {
-      BRIDGE_LOG("Config saved, rebooting in 1s...");
-      vTaskDelay(pdMS_TO_TICKS(1000));
+      BRIDGE_LOG("Config saved — shutting down USB before reboot...");
+      // Close all open USB devices so the client can be deregistered
+      for (auto *conn : connections_) {
+        if (conn->dev_hdl) {
+          conn->connected.store(false);
+          usb_host_interface_release(client_hdl_, conn->dev_hdl, conn->claimed_intf);
+          usb_host_device_close(client_hdl_, conn->dev_hdl);
+          conn->dev_hdl = nullptr;
+        }
+      }
+      // Deregister client — needed before usb_host_uninstall()
+      if (client_hdl_) {
+        usb_host_client_deregister(client_hdl_);
+        client_hdl_ = nullptr;
+      }
+      // Drain remaining library events
+      uint32_t event_flags = 0;
+      usb_host_lib_handle_events(pdMS_TO_TICKS(100), &event_flags);
+      // Uninstall USB host — this SHUTS DOWN the PHY cleanly.
+      // Hub sees D+ pull-down removed → detects disconnect.
+      usb_host_uninstall();
+      BRIDGE_LOG("USB host uninstalled — PHY off, hub sees disconnect");
+      // Short delay to let hub register the disconnect before ESP reboots
+      vTaskDelay(pdMS_TO_TICKS(500));
       esp_restart();
       return true;
     }
@@ -315,6 +353,7 @@ class UsbBridgeComponent : public Component {
   std::vector<DeviceConnection*> connections_;
   std::vector<DiscoveredDevice> discovered_;
   SemaphoreHandle_t discovery_mutex_{nullptr};
+  bool cold_boot_retry_done_{false};
 
   usb_host_client_handle_t client_hdl_{nullptr};
 
