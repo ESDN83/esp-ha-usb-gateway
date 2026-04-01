@@ -47,7 +47,7 @@ esphome/
 1. ESP32 boots, installs USB host (IDF handles PHY init)
 2. Built-in ESP-IDF hub driver enumerates hub + downstream devices
 3. Each detected device appears in `discovered_` list
-4. If a NVS-saved config matches (VID/PID), device is auto-assigned to TCP port
+4. If a NVS-saved config matches (VID/PID/Serial), device is auto-assigned to TCP port
 5. Unconfigured devices show as "Available" in web UI at port 80
 6. User clicks "+ Configure", sets TCP port/baud/etc., clicks "Save & Reboot"
 7. Config is saved to NVS flash, device reboots, devices auto-connect
@@ -88,7 +88,7 @@ CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024  # For config web UI
 ```
 
 ## ESP-IDF Version
-- ESPHome 2026.1.0 uses **ESP-IDF 5.5.2** (`version: recommended`)
+- ESPHome 2026.3.1 uses **ESP-IDF 5.5.2** (`version: recommended`)
 - Hub support since ESP-IDF 5.2
 - ESP32-S3: only **8 USB host channels** (hub + 2 devices can exhaust them)
 
@@ -142,13 +142,13 @@ static bool enum_filter_allow_all_(const usb_device_desc_t *dev_desc, uint8_t *b
 ### Version History (Reboot Fix)
 | Build | Approach | Result |
 |-------|----------|--------|
-| 2026-03-31-h (29fd2bf) | GPIO SE0 2×100ms + enum_filter_cb_ (real function) | Worked sometimes (warm reboot OK, cold boot intermittent) |
+| 2026-03-31-h (29fd2bf) | GPIO SE0 2×100ms + real enum_filter_cb_ | Worked sometimes (warm reboot OK, cold boot intermittent) |
 | 2026-04-01-a | Removed enum filter (nullptr) | **BROKE ALL** — 0 devices, even on reconnect |
 | 2026-04-01-b | No GPIO, no filter, UART0 fix | Stable but 0 devices |
-| 2026-04-01-c | Restored enum_filter_allow_all_ + SE0 + UART0 | Cold boot works after cable reconnect |
+| 2026-04-01-c | Restored enum_filter_allow_all_ + SE0 + UART0 | Works after cable reconnect only |
 | 2026-04-01-d | 3s cold-boot wait before SE0 | First boot OK, subsequent reboots fail |
 | 2026-04-01-e | SE0 immediately before usb_host_install() | Still no devices after reboot |
-| **2026-04-01-f** | **Clean USB shutdown before reboot + cold boot retry** | **Testing** |
+| **2026-04-01-f** | **Clean USB shutdown before reboot + cold boot retry** | **All 3 test cases pass ✅** |
 
 ### Key Learnings
 - ESP32-S3 internal USB PHY isolates GPIO19/20 — cannot manipulate USB bus via GPIO
@@ -156,13 +156,6 @@ static bool enum_filter_allow_all_(const usb_device_desc_t *dev_desc, uint8_t *b
 - `USB_SERIAL_JTAG` and USB OTG share GPIO19/20 — cannot use both
 - USB hub must see proper electrical disconnect to re-enumerate devices
 - `usb_host_uninstall()` properly shuts down PHY (removes pull-downs)
-
-## Root Port Reset Fix (Legacy)
-The original "Root port reset failed" error was caused by:
-1. **Client registration race** — lib task processing before client registered.
-   Fix: register client in `setup()` before starting tasks.
-2. **Built-in hub driver conflict** — custom hub code conflicted.
-   Fix: let built-in driver handle hubs, skip hub class devices.
 
 ## Known Limitations
 - **8 HCD channels**: ESP32-S3 limit. Hub + 2 serial devices is the practical max.
@@ -172,47 +165,47 @@ The original "Root port reset failed" error was caused by:
 ## Tested Device Combinations (2026-04-01)
 | Combo | Sticks | Result |
 |-------|--------|--------|
-| SkyConnect + Sonoff Zigbee 3.0 | 2x CP210X | ✅ Beide erkannt und funktional |
-| SkyConnect + EnOcean USB 300 | CP210X + FTDI | ❌ Nur EnOcean wird aktiv, SkyConnect fällt aus (HCD channel limit) |
-| Sonoff + EnOcean USB 300 | CP210X + FTDI | ❌ Gleiches Problem — 3. Device überschreitet Channel-Limit |
+| SkyConnect + Sonoff Zigbee 3.0 | 2x CP210X | ✅ Both detected and functional |
+| SkyConnect + EnOcean USB 300 | CP210X + FTDI | ❌ Only EnOcean active, SkyConnect dropped (HCD channel limit) |
+| Sonoff + EnOcean USB 300 | CP210X + FTDI | ❌ Same issue — 3rd device exceeds channel limit |
 
-**Fazit**: Mit USB-Hub maximal 2 Serial-Devices gleichzeitig nutzbar.
-Ohne Hub (USB-C OTG Splitter) möglicherweise besser, da Hub selbst Channels belegt.
+**Conclusion**: With USB hub, max 2 serial devices simultaneously.
+Without hub (USB-C OTG splitter) may be better, as hub itself uses channels.
 
 ## Integration Tests (2026-04-01)
 | Integration | Stick | Transport | Status |
 |-------------|-------|-----------|--------|
-| ZHA | SkyConnect | Direkt am HA (USB) | ✅ Läuft |
-| Zigbee2MQTT 2.9.1 | Sonoff Zigbee 3.0 V2 | TCP via ESP Bridge (port 8880) | ✅ Läuft |
-| Z2M + SONOFF SNZB-06P | Sonoff | TCP | ✅ Gepairt und funktional |
-| Z2M + EnOcean PTM 215ZE | Sonoff | TCP | ✅ Green Power Gerät gepairt |
-| EnOcean MQTT UI | EnOcean USB 300 | TCP via ESP Bridge | ✅ (wenn alleine oder mit nur 1 weiteren Stick) |
+| ZHA | SkyConnect | Direct USB on HA host | ✅ Running |
+| Zigbee2MQTT 2.9.1 | Sonoff Zigbee 3.0 V2 | TCP via ESP Bridge (port 8880) | ✅ Running |
+| Z2M + SONOFF SNZB-06P | Sonoff | TCP | ✅ Paired and functional |
+| Z2M + EnOcean PTM 215ZE | Sonoff | TCP | ✅ Green Power device paired |
+| EnOcean MQTT UI | EnOcean USB 300 | TCP via ESP Bridge | ✅ (when alone or with 1 other stick) |
 
 ## Planned Improvements
-- [ ] USB-C OTG Splitter statt großem Hub (spart HCD channels)
-- [ ] Web UI: Dokumentation/Bilder/Menü
-- [ ] Web UI: Passwortschutz (verhindert Umkonfiguration im Netzwerk)
-- [ ] Testen ob ohne Hub mehr als 2 Devices gleichzeitig möglich sind
+- [ ] USB-C OTG splitter instead of large hub (saves HCD channels)
+- [ ] Web UI: documentation, images, menu structure
+- [ ] Web UI: password protection (prevent reconfiguration from network)
+- [ ] Test if more than 2 devices work simultaneously without hub
 
 ## Solved Issues Reference
 | Issue | Fix |
 |-------|-----|
-| Root port reset failed | GPIO PHY reset + client registration order |
-| Control transfer deadlock | Don't do transfers inside event callback |
+| Root port reset failed | Client registration order — register in setup() before starting tasks |
+| Control transfer deadlock | Don't do transfers inside event callback; queue addr, process in monitor task |
 | WDT crash | Single client registration in setup() |
 | Missing endpoints | Manual descriptor walking instead of ESP-IDF parser |
 | lwip socket() conflict | Use lwip_socket() etc. directly |
 | ESPHome git cache | Clean Build Files required after changes |
 | PSRAM + USB conflict | Disable PSRAM via sdkconfig |
 | Hub CP2102 exhausts HCD channels | Enum filter rejects 3rd+ CP210x (hub-internal bridge) |
-| ESP offline after update (build-31g) | `CONFIG_USB_HOST_ENABLE_ENUM_FILTER_CALLBACK` was removed but `enum_filter_cb` still referenced → compile error |
+| ESP offline after update | `CONFIG_USB_HOST_ENABLE_ENUM_FILTER_CALLBACK` removed but `enum_filter_cb` still referenced |
 | Serial matching too strict | Restored VID/PID fallback when device reports no serial |
-| enum_filter_cb=nullptr kills enumeration | With ENABLE_ENUM_FILTER_CALLBACK=y, nullptr causes IDF to skip all enumeration silently. Use real function returning true |
+| enum_filter_cb=nullptr kills enumeration | With ENABLE_ENUM_FILTER_CALLBACK=y, nullptr causes IDF to skip all enumeration. Use real function returning true |
 | USB_SERIAL_JTAG blocks USB OTG | ESPHome 2026.3.x defaults to USB_SERIAL_JTAG on ESP32-S3, shares GPIO19/20. Fix: `hardware_uart: UART0` |
-| Boot loop (RTC_SW_CPU_RST) | `#include "esphome/core/application.h"` and `hal.h` cause static init crash. Removed, use vTaskDelay() |
-| GPIO SE0 ineffective on ESP32-S3 | Internal PHY isolates GPIO19/20 from USB bus. GPIO writes have no effect. Removed GPIO approach |
-| Devices not detected after reboot | USB stack not cleanly shut down before esp_restart(). Fix: uninstall USB host before reboot |
-| Cold boot: hub not ready | Hub boots with ESP, not ready for enumeration. Fix: 10s retry reinstalls USB host |
+| Boot loop (RTC_SW_CPU_RST) | `#include "esphome/core/application.h"` and `hal.h` cause static init crash. Use vTaskDelay() instead |
+| GPIO SE0 ineffective on ESP32-S3 | Internal PHY isolates GPIO19/20 from USB bus. Removed GPIO approach entirely |
+| Devices not detected after reboot | USB stack not cleanly shut down before esp_restart(). Fix: close devices + deregister + usb_host_uninstall() before reboot |
+| Cold boot: hub not ready | Hub boots with ESP, not ready for enumeration. Fix: 10s retry reinstalls USB host stack |
 
 ## Zigbee2MQTT Integration
 
@@ -221,7 +214,7 @@ Ohne Hub (USB-C OTG Splitter) möglicherweise besser, da Hub selbst Channels bel
 serial:
   port: tcp://192.168.1.108:8880   # TCP port from USB bridge web UI
   baudrate: 115200                  # Standard for Silicon Labs adapters
-  adapter: ember                    # NOT 'ezsp' (deprecated)
+  adapter: ember                    # NOT 'ezsp' (deprecated in Z2M 2.x)
 ```
 
 ### Important Notes
@@ -229,8 +222,66 @@ serial:
 - `adapter: zstack` for Texas Instruments (CC2652-based dongles)
 - Baudrate must match both Z2M config AND USB bridge config (both 115200)
 - TCP port must match the port assigned in USB bridge web UI
+- MQTT server must be `mqtt://core-mosquitto:1883` (not `localhost` — Docker networking)
 - WiFi-based bridges: Z2M warns about packet loss. Wired Ethernet preferred.
-- Sonoff Zigbee 3.0 USB Dongle Plus V2: VID=10C4, PID=EA60, S/N=847a1592b049ef11a799d58cff00cc63
+- `adapter` field belongs in `/config/zigbee2mqtt/configuration.yaml`, NOT in the addon options UI
+- Green Power devices (PTM 215ZE) require Zigbee channel 11, 15, 20, or 25
+
+## Bugfix Session 2026-03-30
+
+### Reported Issues
+1. No device re-enumeration after reboot — devices not detected without unplugging
+2. "Assigned" status jumped between SkyConnect and Sonoff
+3. After Save & Reboot: wrong device got the mapping
+4. TCP connection silent — Zigbee2MQTT could not communicate with stick
+5. Debug log missing from web UI
+6. Refresh button non-functional
+
+### Root Causes & Fixes
+1. **PHY reset too short** — SE0 from 100ms to 500ms, settle from 2.1s to 3s
+2. **is_assigned matched by VID/PID instead of USB address** — now address-based, no confusion
+3. **No serial number matching** — NVS v2 stores serial, matching uses VID+PID+Serial
+4. **CDC-ACM missing SET_CONTROL_LINE_STATE** — DTR+RTS were not activated, stick stayed silent.
+   Additionally: CDC default interface set to 1 (Data instead of Control), auto-fallback to other interfaces
+5. **Ring buffer log (4KB)** — new endpoint `/api/usb/log`, panel in web UI, auto-refresh 10s
+6. **Refresh overwrote local configs** — refresh now only fetches status, not config
+
+### NVS Breaking Change
+- NVS config version 1 → 2 (serial field added)
+- Old v1 configs are automatically deleted on first boot
+- User must reconfigure devices after this update
+
+### CDC-ACM Init
+```
+SET_LINE_CODING: baud, 8N1
+SET_CONTROL_LINE_STATE: DTR=1, RTS=1  ← THIS WAS MISSING
+```
+Without DTR/RTS activated, many CDC-ACM chips (CH9102, ATmega16U2) do not respond.
+
+### Architecture Notes
+
+#### 1) USB Device Re-enumeration After Reboot ✅
+- **Goal**: Hub + devices must reliably re-enumerate after ESP reboot.
+- **Final fix**: Clean USB stack shutdown before `esp_restart()` + cold boot retry after 10s.
+- **Note**: GPIO SE0 approach was abandoned — does not work on ESP32-S3 internal PHY.
+
+#### 2) Control Transfer Timeouts (CP210X/FTDI/CDC Init)
+- **Root cause**: Control transfers called from USB client event callback → deadlock,
+  because completion callbacks are only delivered via `usb_host_client_handle_events()`.
+- **Fix**:
+  - Event callback only queues device address — no `device_open()`, no transfers.
+  - Device processing happens in monitor task (drains queue).
+  - `ctrl_transfer_sync_()` pumps client events while waiting for completion.
+
+#### 3) "Only first device connects" / `interface_claim() = ESP_ERR_NOT_SUPPORTED` ✅
+- **Root cause**: ESP32-S3 has only **8 USB Host (HCD) channels**. Hub + multiple devices exhaust them quickly.
+- **Practical limit**: With typical USB 2.0 hub, max **2 serial devices simultaneously**.
+- **Fix**: `enum_filter_allow_all_()` accepts all devices. User selects via web UI.
+- **IMPORTANT**: `CONFIG_USB_HOST_ENABLE_ENUM_FILTER_CALLBACK=y` must be set in sdkconfig,
+  otherwise the `enum_filter_cb` field does not exist in `usb_host_config_t`.
+
+#### 4) Debug Log: ESPHome Log + Web UI simultaneously
+- ESPHome log via `ESP_LOGI/W/E`, plus ring buffer append for web UI (`/api/usb/log`).
 
 ## GitHub
 - **Repo**: https://github.com/ESDN83/esp-ha-usb-gateway
@@ -240,123 +291,3 @@ serial:
 - ESP-IDF USB issues: #10086, #12412, #9519, #13933, #17918
 - SLZB-MR5U: ESP32-based USB passthrough with device selection UI
 - HB-RF-ETH-ng: https://github.com/Xerolux/HB-RF-ETH-ng (Vue 3 web UI reference)
-
-
-
-## Bugfix Session 2026-03-30
-
-### User-reported issues (29.03.2026)
-1. Power cycle nach reboot fehlte — Devices nicht erkannt ohne Abstecken
-2. "Assigned" Status sprang zwischen SkyConnect und Sonoff hin und her
-3. Nach Save & Reboot: falsches Device bekam das Mapping
-4. TCP-Verbindung stumm — Zigbee2MQTT konnte Stick nicht ansprechen
-5. Debug-Log im Web-UI fehlte
-6. Refresh-Button ohne Funktion
-
-### Root Causes & Fixes
-1. **PHY Reset zu kurz** — SE0 von 100ms auf 500ms, settle von 2.1s auf 3s
-2. **is_assigned per VID/PID statt USB-Adresse** — jetzt Adress-basiert, kein Verwechseln
-3. **Kein Serial-Number-Matching** — NVS v2 speichert Serial, Matching nutzt VID+PID+Serial
-4. **CDC-ACM fehlte SET_CONTROL_LINE_STATE** — DTR+RTS wurden nicht aktiviert, Stick blieb stumm.
-   Zusätzlich: CDC Default-Interface auf 1 (Data statt Control), auto-fallback auf andere Interfaces
-5. **Ring-Buffer Log (4KB)** — neuer Endpoint `/api/usb/log`, Panel im Web-UI, auto-refresh 10s
-6. **Refresh überschrieb lokale Configs** — Refresh holt jetzt nur Status, nicht Config
-
-### NVS Breaking Change
-- NVS Config Version 1 → 2 (serial field added)
-- Alte v1 configs werden beim ersten Start automatisch gelöscht
-- User muss Devices neu konfigurieren nach diesem Update
-
-### CDC-ACM Init (neu)
-```
-SET_LINE_CODING: baud, 8N1
-SET_CONTROL_LINE_STATE: DTR=1, RTS=1  ← DAS FEHLTE!
-```
-Ohne DTR/RTS aktiviert antworten viele CDC-ACM Chips (CH9102, ATmega16U2) nicht.
-
-
-
-### Next Steps (ToDo) — aus den Findings am Ende
-
-#### 1) USB-Geräte nach Reboot ohne Abstecken ✅
-- **Ziel**: Hub + Devices müssen nach ESP-Reboot sicher neu enumerieren.
-- **Fix**: **SE0 Reset** auf GPIO19/20 (D-/D+) beim Boot: 2× 100ms Pulse mit 500ms Pause + 3s settle, *bevor* `usb_host_install()` läuft.
-- **Wichtig**: Das ist kein “Powercycle” des Hubs, sondern erzwingt für den Hub einen **Disconnect/Reconnect** am Root-Port.
-- **Achtung**: Zu langer settle delay (>5s) kann ESPHome Setup-Watchdog auslösen.
-
-#### 2) Control-Transfer Timeouts (CP210X/FTDI/CDC Init)
-- **Root Cause**: Control-Transfers wurden (oder wurden früher) aus dem USB Client Event Callback heraus gestartet → Deadlock, weil die Completion-Callbacks erst über `usb_host_client_handle_events()` zugestellt werden.
-- **Fix**:
-  - **Event-Callback macht nur Queueing** (addr in Queue), keine `device_open()`/keine Transfers.
-  - **Device-Prozessing in Monitor-Task** (drained queue).
-  - `ctrl_transfer_sync_()` **pumpt client events** während es auf Completion wartet.
-
-#### 3) “Nur das erste Device wird Connected” / `interface_claim(...) = ESP_ERR_NOT_SUPPORTED` ✅
-- **Root Cause**: **ESP32-S3 hat nur 8 USB Host (HCD) Channels**. Bei Hub + mehreren Geräten sind die Channels schnell aufgebraucht.
-  - Hub belegt Channels, jedes enumerierte Device braucht Ressourcen; zusätzlich kommen Bulk-Endpoints pro aktivem Serial-Device dazu.
-- **Praktisches Limit**: Mit typischem USB2-Hub sind meist **max. 2 Serial-Geräte gleichzeitig** realistisch.
-- **Fix**: `enum_filter_cb_` erlaubt max. 2 CP210x (die echten Sticks) und blockt den 3.+ (Hub-interne CP2102, S/N `0001`). Hubs und alle Nicht-CP210x werden immer durchgelassen.
-- **WICHTIG**: `CONFIG_USB_HOST_ENABLE_ENUM_FILTER_CALLBACK=y` muss in sdkconfig gesetzt sein, sonst existiert das `enum_filter_cb` Feld in `usb_host_config_t` nicht (Compile Error!).
-- **Dokumentation**: Dieses Limit ist “by design” (Hardware/IDF), kein reiner Code-Bug.
-
-#### 4) Debug Log: ESPHome Log + Web UI gleichzeitig
-- **Ziel**: Logs müssen **weiterhin im ESPHome Logger** erscheinen und parallel im Web-UI (Ringbuffer) abrufbar sein (`/api/usb/log`).
-- **Umsetzung**: ESPHome Log über `ESP_LOGI/W/E`, zusätzlich Ringbuffer append.
-
-### User Log (Beispiel) — reproduzierbarer Fehlerfall
-Folgender Log zeigt die 3 zentralen Probleme (CP210X ctrl timeout, Hub-internes CP2102, Channel-Limit bei interface_claim):
-
-USB Gateway initializing...
-USB PHY reset: SE0 on GPIO19/20 for 500ms...
-  Config: Sonoff Zigbee 3.0 USB Dongle Pl VID=10C4 PID=EA60 S/N=847a1592b049ef11a799d58cff00cc63 port=8881 baud=115200
-  Config: USB <-> Serial VID=0403 PID=6001 S/N=(none) port=8882 baud=115200
-  Config: SkyConnect v1.0 VID=10C4 PID=EA60 S/N=581c7557bf9ced11baa37ffaa7669f5d port=8883 baud=115200
-Loaded 3 saved device configs from NVS
-USB TCP Gateway ready — config UI at http://<ip>/
->>> New USB device event (addr=2)
-Device addr=2: VID=10C4 PID=EA60 Class=00
-  Manufacturer: Nabu Casa
-  Product: SkyConnect v1.0
-  Serial: 581c7557bf9ced11baa37ffaa7669f5d
-  Interfaces: 1, TotalLength: 32
-  Matched config: SkyConnect v1.0 (port=8883)
-  Chip type: CP210X
-  Bulk IN: EP 0x82 (MPS=64), Bulk OUT: EP 0x02, Intf: 0
-  Initializing CP210X (115200 baud, autoboot=1)...
-TCP server listening on port 8882 for USB <-> Serial
-TCP server listening on port 8881 for Sonoff Zigbee 3.0 USB Dongle Pl
-TCP server listening on port 8883 for SkyConnect v1.0
-    CP210X IFC_ENABLE: ESP_ERR_TIMEOUT
-    CP210X SET_MHS (no DTR/RTS toggle): ESP_ERR_TIMEOUT
-    CP210X SET_BAUDRATE(115200): ESP_ERR_TIMEOUT
-=== ASSIGNED SkyConnect v1.0 (VID=10C4 PID=EA60 addr=2) -> TCP port 8883 ===
-Bulk read task started for SkyConnect v1.0 (port 8883)
->>> New USB device event (addr=3)
-Device addr=3: VID=10C4 PID=EA60 Class=00
-  Manufacturer: Silicon Labs
-  Product: CP2102 USB to UART Bridge Controller
-  Serial: 0001
-  Interfaces: 1, TotalLength: 32
-  No matching config — available in web UI
->>> New USB device event (addr=4)
-Device addr=4: VID=10C4 PID=EA60 Class=00
-  Manufacturer: Itead
-  Product: Sonoff Zigbee 3.0 USB Dongle Plus V2
-  Serial: 847a1592b049ef11a799d58cff00cc63
-  Interfaces: 1, TotalLength: 32
-  Matched config: Sonoff Zigbee 3.0 USB Dongle Pl (port=8881)
-  Chip type: CP210X
-  Bulk IN: EP 0x82 (MPS=64), Bulk OUT: EP 0x02, Intf: 0
-ERR:   interface_claim(0) failed: ESP_ERR_NOT_SUPPORTED
->>> New USB device event (addr=5)
-Device addr=5: VID=0403 PID=6001 Class=00
-  Manufacturer: FTDI
-  Product: USB <-> Serial
-  Serial: (none)
-  Interfaces: 1, TotalLength: 32
-  Matched config: USB <-> Serial (port=8882)
-  Chip type: FTDI
-  Bulk IN: EP 0x81 (MPS=64), Bulk OUT: EP 0x02, Intf: 0
-ERR:   interface_claim(0) failed: ESP_ERR_NOT_SUPPORTED
-WARN: Bulk IN submit failed port 8883: ESP_ERR_INVALID_STATE (errors=1)
-Bulk read task ended for SkyConnect v1.0 (rx=0 bytes, errors=1)
