@@ -44,11 +44,11 @@ esphome/
 ```
 
 ### How It Works
-1. ESP32 boots, resets USB PHY (GPIO19/20 SE0), installs USB host
+1. ESP32 boots, installs USB host (IDF handles PHY init)
 2. Built-in ESP-IDF hub driver enumerates hub + downstream devices
 3. Each detected device appears in `discovered_` list
 4. If a NVS-saved config matches (VID/PID), device is auto-assigned to TCP port
-5. Unconfigured devices show as "Available" in web UI at port 81
+5. Unconfigured devices show as "Available" in web UI at port 80
 6. User clicks "+ Configure", sets TCP port/baud/etc., clicks "Save & Reboot"
 7. Config is saved to NVS flash, device reboots, devices auto-connect
 
@@ -60,12 +60,12 @@ esphome/
 | tcp_srv | 8192 | 1 | 5 | TCP server per configured device |
 | usb_rx | 4096 | 1 | 6 | Bulk IN reader per connected device |
 
-### Web UI (port 81)
-- **Detected Devices**: auto-populated from USB bus scan
+### Web UI (port 80)
+- **Detected Devices**: auto-populated from USB bus scan (all devices, no filter)
 - **Configured Mappings**: saved device-to-TCP-port assignments
-- REST API: `GET/POST /api/usb/config`, `GET /api/usb/status`
+- REST API: `GET/POST /api/usb/config`, `GET /api/usb/status`, `GET /api/usb/log`
 - Config stored in NVS flash (survives reboots, no YAML needed)
-- Save & Reboot applies changes
+- Save & Reboot: saves config, cleanly shuts down USB, then reboots
 
 ### Chip Support
 | Type | Detection | Init Protocol |
@@ -92,13 +92,76 @@ CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024  # For config web UI
 - Hub support since ESP-IDF 5.2
 - ESP32-S3: only **8 USB host channels** (hub + 2 devices can exhaust them)
 
-## Root Port Reset Fix
-The "Root port reset failed" error was caused by:
-1. **No USB PHY reset at boot** — hub already connected confuses ESP-IDF.
-   Fix: drive GPIO19/20 LOW for 100ms before `usb_host_install()`.
-2. **Client registration race** — lib task processing before client registered.
+## USB Device Detection After Reboot (Solved 2026-04-01)
+
+### Problem
+After ESP reboot (Save&Reboot or power cycle), USB devices are NOT detected.
+Only physical USB cable disconnect/reconnect works. Hub never re-enumerates.
+
+### Root Causes Found
+
+1. **GPIO SE0 does NOT work on ESP32-S3 internal PHY** — GPIO19/20 are isolated
+   by the USB PHY hardware. Writing LOW to these pins has no effect on the actual
+   USB D+/D- lines. All GPIO-based reset approaches are a dead end.
+
+2. **`enum_filter_cb = nullptr` with `CONFIG_USB_HOST_ENABLE_ENUM_FILTER_CALLBACK=y`**
+   causes ESP-IDF to silently skip device enumeration. Zero devices detected, even
+   on physical reconnect. Must use a real callback function (can return `true` for all).
+
+3. **`USB_SERIAL_JTAG` logger (ESPHome 2026.3.x default on ESP32-S3)** blocks
+   GPIO19/20 needed for USB OTG host mode. Must set `hardware_uart: UART0` in YAML.
+
+4. **`usb_host_install()` does not reliably detect already-connected devices** when
+   the hub was never properly disconnected from the host.
+
+### Solution (Build 2026-04-01-f)
+
+**Warm Reboot (Save & Reboot):**
+Before `esp_restart()`, cleanly shut down the USB stack:
+```cpp
+// Close all devices → deregister client → usb_host_uninstall()
+// This turns OFF the PHY → hub sees real electrical disconnect
+// 500ms delay → esp_restart() → usb_host_install() → hub sees connect
+```
+
+**Cold Boot (Power Cycle):**
+ESP and hub power up simultaneously. Hub may not be ready when
+`usb_host_install()` runs. Retry mechanism in `loop()`:
+- After 10 seconds with 0 devices → uninstall + reinstall USB host stack
+- Second attempt catches the now-ready hub
+
+**Enum Filter:**
+```cpp
+// Real callback function that allows ALL devices (returns true)
+// NOT nullptr — nullptr breaks enumeration with ENABLE_ENUM_FILTER_CALLBACK
+static bool enum_filter_allow_all_(const usb_device_desc_t *dev_desc, uint8_t *bConfigurationValue) {
+    return true;
+}
+```
+
+### Version History (Reboot Fix)
+| Build | Approach | Result |
+|-------|----------|--------|
+| 2026-03-31-h (29fd2bf) | GPIO SE0 2×100ms + enum_filter_cb_ (real function) | Worked sometimes (warm reboot OK, cold boot intermittent) |
+| 2026-04-01-a | Removed enum filter (nullptr) | **BROKE ALL** — 0 devices, even on reconnect |
+| 2026-04-01-b | No GPIO, no filter, UART0 fix | Stable but 0 devices |
+| 2026-04-01-c | Restored enum_filter_allow_all_ + SE0 + UART0 | Cold boot works after cable reconnect |
+| 2026-04-01-d | 3s cold-boot wait before SE0 | First boot OK, subsequent reboots fail |
+| 2026-04-01-e | SE0 immediately before usb_host_install() | Still no devices after reboot |
+| **2026-04-01-f** | **Clean USB shutdown before reboot + cold boot retry** | **Testing** |
+
+### Key Learnings
+- ESP32-S3 internal USB PHY isolates GPIO19/20 — cannot manipulate USB bus via GPIO
+- `CONFIG_USB_HOST_ENABLE_ENUM_FILTER_CALLBACK` must be enabled AND callback must be non-null
+- `USB_SERIAL_JTAG` and USB OTG share GPIO19/20 — cannot use both
+- USB hub must see proper electrical disconnect to re-enumerate devices
+- `usb_host_uninstall()` properly shuts down PHY (removes pull-downs)
+
+## Root Port Reset Fix (Legacy)
+The original "Root port reset failed" error was caused by:
+1. **Client registration race** — lib task processing before client registered.
    Fix: register client in `setup()` before starting tasks.
-3. **Built-in hub driver conflict** — custom hub code conflicted.
+2. **Built-in hub driver conflict** — custom hub code conflicted.
    Fix: let built-in driver handle hubs, skip hub class devices.
 
 ## Known Limitations
@@ -119,6 +182,30 @@ The "Root port reset failed" error was caused by:
 | Hub CP2102 exhausts HCD channels | Enum filter rejects 3rd+ CP210x (hub-internal bridge) |
 | ESP offline after update (build-31g) | `CONFIG_USB_HOST_ENABLE_ENUM_FILTER_CALLBACK` was removed but `enum_filter_cb` still referenced → compile error |
 | Serial matching too strict | Restored VID/PID fallback when device reports no serial |
+| enum_filter_cb=nullptr kills enumeration | With ENABLE_ENUM_FILTER_CALLBACK=y, nullptr causes IDF to skip all enumeration silently. Use real function returning true |
+| USB_SERIAL_JTAG blocks USB OTG | ESPHome 2026.3.x defaults to USB_SERIAL_JTAG on ESP32-S3, shares GPIO19/20. Fix: `hardware_uart: UART0` |
+| Boot loop (RTC_SW_CPU_RST) | `#include "esphome/core/application.h"` and `hal.h` cause static init crash. Removed, use vTaskDelay() |
+| GPIO SE0 ineffective on ESP32-S3 | Internal PHY isolates GPIO19/20 from USB bus. GPIO writes have no effect. Removed GPIO approach |
+| Devices not detected after reboot | USB stack not cleanly shut down before esp_restart(). Fix: uninstall USB host before reboot |
+| Cold boot: hub not ready | Hub boots with ESP, not ready for enumeration. Fix: 10s retry reinstalls USB host |
+
+## Zigbee2MQTT Integration
+
+### Configuration (HA Addon)
+```yaml
+serial:
+  port: tcp://192.168.1.108:8880   # TCP port from USB bridge web UI
+  baudrate: 115200                  # Standard for Silicon Labs adapters
+  adapter: ember                    # NOT 'ezsp' (deprecated)
+```
+
+### Important Notes
+- `adapter: ezsp` is deprecated → use `ember` for Silicon Labs (Sonoff ZBDongle-E, SkyConnect)
+- `adapter: zstack` for Texas Instruments (CC2652-based dongles)
+- Baudrate must match both Z2M config AND USB bridge config (both 115200)
+- TCP port must match the port assigned in USB bridge web UI
+- WiFi-based bridges: Z2M warns about packet loss. Wired Ethernet preferred.
+- Sonoff Zigbee 3.0 USB Dongle Plus V2: VID=10C4, PID=EA60, S/N=847a1592b049ef11a799d58cff00cc63
 
 ## GitHub
 - **Repo**: https://github.com/ESDN83/esp-ha-usb-gateway
