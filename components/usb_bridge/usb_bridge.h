@@ -27,7 +27,7 @@ namespace esphome {
 namespace usb_bridge {
 
 static const char *const TAG = "usb_bridge";
-static const char *const FW_BUILD_ID = "usb-bridge build 2026-04-01-c";
+static const char *const FW_BUILD_ID = "usb-bridge build 2026-04-01-d";
 
 // Known USB serial chip vendors
 static constexpr uint16_t FTDI_VID = 0x0403;
@@ -235,14 +235,18 @@ class UsbBridgeComponent : public Component {
     ctrl_xfer_done_ = xSemaphoreCreateBinary();
     new_dev_queue_ = xQueueCreate(8, sizeof(uint8_t));
 
-    // SE0 reset: force hub to see disconnect, then re-enumerate after reboot
-    BRIDGE_LOG("USB PHY reset pulse 1: SE0 GPIO19/20 100ms...");
-    phy_se0_pulse_ms_(100);
-    BRIDGE_LOG("USB PHY pause 500ms...");
+    // Cold boot: ESP + hub power up together. Hub needs ~2-3s to initialize.
+    // SE0 pulse before hub is ready has no effect (hub isn't tracking the port yet).
+    // Warm reboot: hub keeps power, is already running — SE0 works immediately.
+    // Strategy: wait for hub to be up first, THEN send SE0 disconnect signal.
+    BRIDGE_LOG("Waiting 3s for USB hub cold-boot init...");
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    BRIDGE_LOG("USB SE0 reset pulse 1: GPIO19/20 LOW 150ms...");
+    phy_se0_pulse_ms_(150);
     vTaskDelay(pdMS_TO_TICKS(500));
-    BRIDGE_LOG("USB PHY reset pulse 2: SE0 GPIO19/20 100ms...");
-    phy_se0_pulse_ms_(100);
-    BRIDGE_LOG("PHY settle: waiting 3s for hub + downstream...");
+    BRIDGE_LOG("USB SE0 reset pulse 2: GPIO19/20 LOW 150ms...");
+    phy_se0_pulse_ms_(150);
+    BRIDGE_LOG("Waiting 3s for hub re-enumeration...");
     vTaskDelay(pdMS_TO_TICKS(3000));
 
     load_nvs_config_();
