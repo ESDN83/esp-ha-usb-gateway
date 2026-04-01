@@ -169,6 +169,31 @@ The original "Root port reset failed" error was caused by:
 - **No hot-add of configs**: changing config requires reboot (Save & Reboot).
 - **Single TCP client per port**: one client at a time per device.
 
+## Tested Device Combinations (2026-04-01)
+| Combo | Sticks | Result |
+|-------|--------|--------|
+| SkyConnect + Sonoff Zigbee 3.0 | 2x CP210X | ✅ Beide erkannt und funktional |
+| SkyConnect + EnOcean USB 300 | CP210X + FTDI | ❌ Nur EnOcean wird aktiv, SkyConnect fällt aus (HCD channel limit) |
+| Sonoff + EnOcean USB 300 | CP210X + FTDI | ❌ Gleiches Problem — 3. Device überschreitet Channel-Limit |
+
+**Fazit**: Mit USB-Hub maximal 2 Serial-Devices gleichzeitig nutzbar.
+Ohne Hub (USB-C OTG Splitter) möglicherweise besser, da Hub selbst Channels belegt.
+
+## Integration Tests (2026-04-01)
+| Integration | Stick | Transport | Status |
+|-------------|-------|-----------|--------|
+| ZHA | SkyConnect | Direkt am HA (USB) | ✅ Läuft |
+| Zigbee2MQTT 2.9.1 | Sonoff Zigbee 3.0 V2 | TCP via ESP Bridge (port 8880) | ✅ Läuft |
+| Z2M + SONOFF SNZB-06P | Sonoff | TCP | ✅ Gepairt und funktional |
+| Z2M + EnOcean PTM 215ZE | Sonoff | TCP | ✅ Green Power Gerät gepairt |
+| EnOcean MQTT UI | EnOcean USB 300 | TCP via ESP Bridge | ✅ (wenn alleine oder mit nur 1 weiteren Stick) |
+
+## Planned Improvements
+- [ ] USB-C OTG Splitter statt großem Hub (spart HCD channels)
+- [ ] Web UI: Dokumentation/Bilder/Menü
+- [ ] Web UI: Passwortschutz (verhindert Umkonfiguration im Netzwerk)
+- [ ] Testen ob ohne Hub mehr als 2 Devices gleichzeitig möglich sind
+
 ## Solved Issues Reference
 | Issue | Fix |
 |-------|-----|
