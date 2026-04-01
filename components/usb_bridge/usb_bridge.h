@@ -27,7 +27,7 @@ namespace esphome {
 namespace usb_bridge {
 
 static const char *const TAG = "usb_bridge";
-static const char *const FW_BUILD_ID = "usb-bridge build 2026-04-01-b";
+static const char *const FW_BUILD_ID = "usb-bridge build 2026-04-01-c";
 
 // Known USB serial chip vendors
 static constexpr uint16_t FTDI_VID = 0x0403;
@@ -179,23 +179,32 @@ struct DeviceConnection {
   SemaphoreHandle_t bulk_in_sem{nullptr};
 };
 
-// Drive D+/D- LOW (SE0 = disconnect) via GPIO before USB PHY is initialized.
-// On ESP32-S3 the internal PHY owns GPIO19/20 once usb_host_install() runs,
-// but BEFORE that call the pins are free and GPIO writes DO reach the bus.
-static void usb_force_disconnect_gpio_(int hold_ms) {
-  gpio_config_t io = {};
-  io.intr_type = GPIO_INTR_DISABLE;
-  io.mode = GPIO_MODE_OUTPUT;
-  io.pin_bit_mask = (1ULL << 19) | (1ULL << 20);
-  io.pull_down_en = GPIO_PULLDOWN_DISABLE;
-  io.pull_up_en = GPIO_PULLUP_DISABLE;
-  gpio_config(&io);
+// Enum filter: accept ALL devices (hubs, serial adapters, everything).
+// We need a real callback function — passing nullptr when
+// CONFIG_USB_HOST_ENABLE_ENUM_FILTER_CALLBACK is enabled can cause
+// ESP-IDF to silently skip enumeration.
+static bool enum_filter_allow_all_(const usb_device_desc_t *dev_desc, uint8_t *bConfigurationValue) {
+  ESP_LOGI(TAG, "Enum filter: ALLOW VID=%04X PID=%04X class=%02X",
+           dev_desc->idVendor, dev_desc->idProduct, dev_desc->bDeviceClass);
+  return true;
+}
+
+// SE0 pulse on D+/D- (GPIO19/20) before USB PHY is initialized.
+// Forces the hub to see a disconnect, so it re-enumerates all downstream
+// devices after ESP reboot.  Must be called BEFORE usb_host_install().
+static void phy_se0_pulse_ms_(int ms) {
+  gpio_config_t io_conf = {};
+  io_conf.intr_type = GPIO_INTR_DISABLE;
+  io_conf.mode = GPIO_MODE_OUTPUT;
+  io_conf.pin_bit_mask = (1ULL << 19) | (1ULL << 20);
+  io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+  io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
+  gpio_config(&io_conf);
   gpio_set_level(GPIO_NUM_19, 0);
   gpio_set_level(GPIO_NUM_20, 0);
-  vTaskDelay(pdMS_TO_TICKS(hold_ms));
-  // Release pins back to input — they will float (J-state / idle)
-  io.mode = GPIO_MODE_INPUT;
-  gpio_config(&io);
+  vTaskDelay(pdMS_TO_TICKS(ms));
+  io_conf.mode = GPIO_MODE_INPUT;
+  gpio_config(&io_conf);
 }
 
 class UsbBridgeComponent : public Component {
@@ -212,9 +221,8 @@ class UsbBridgeComponent : public Component {
     log_ring_init_();
     BRIDGE_LOG("USB Gateway initializing...");
     BRIDGE_LOG("%s", FW_BUILD_ID);
-    BRIDGE_LOG("USB host: no enum filter, all devices enumerated (user selects via web UI)");
+    BRIDGE_LOG("USB host: enum filter allows ALL devices (user selects via web UI)");
     // Avoid ESP32 OTA rollback during rapid reboot test cycles.
-    // If rollback isn't pending, ESP_ERR_INVALID_STATE is expected and harmless.
     esp_err_t ota_mark = esp_ota_mark_app_valid_cancel_rollback();
     if (ota_mark == ESP_OK) {
       BRIDGE_LOG("OTA app marked valid");
@@ -227,8 +235,15 @@ class UsbBridgeComponent : public Component {
     ctrl_xfer_done_ = xSemaphoreCreateBinary();
     new_dev_queue_ = xQueueCreate(8, sizeof(uint8_t));
 
-    // No GPIO/PHY manipulation — let usb_host_install() handle everything.
-    // Hub re-enumeration after reboot is handled by IDF's own root port reset.
+    // SE0 reset: force hub to see disconnect, then re-enumerate after reboot
+    BRIDGE_LOG("USB PHY reset pulse 1: SE0 GPIO19/20 100ms...");
+    phy_se0_pulse_ms_(100);
+    BRIDGE_LOG("USB PHY pause 500ms...");
+    vTaskDelay(pdMS_TO_TICKS(500));
+    BRIDGE_LOG("USB PHY reset pulse 2: SE0 GPIO19/20 100ms...");
+    phy_se0_pulse_ms_(100);
+    BRIDGE_LOG("PHY settle: waiting 3s for hub + downstream...");
+    vTaskDelay(pdMS_TO_TICKS(3000));
 
     load_nvs_config_();
     BRIDGE_LOG("Loaded %zu saved device configs from NVS", connections_.size());
@@ -236,7 +251,7 @@ class UsbBridgeComponent : public Component {
     const usb_host_config_t host_config = {
         .skip_phy_setup = false,
         .intr_flags = ESP_INTR_FLAG_LEVEL1,
-        .enum_filter_cb = nullptr,
+        .enum_filter_cb = enum_filter_allow_all_,
     };
     esp_err_t err = usb_host_install(&host_config);
     if (err != ESP_OK) {
@@ -244,7 +259,7 @@ class UsbBridgeComponent : public Component {
       this->mark_failed();
       return;
     }
-    BRIDGE_LOG("USB Host installed (skip_phy=false, no GPIO reset)");
+    BRIDGE_LOG("USB Host installed (SE0 reset done, enum_filter=allow_all)");
 
     const usb_host_client_config_t client_config = {
         .is_synchronous = false,
@@ -260,8 +275,6 @@ class UsbBridgeComponent : public Component {
       this->mark_failed();
       return;
     }
-    BRIDGE_LOG("USB client registered — waiting for devices...");
-
     xTaskCreatePinnedToCore(usb_lib_task_, "usb_lib", 8192, nullptr, 10, nullptr, 0);
     xTaskCreatePinnedToCore(usb_task_entry_, "usb_mon", 8192, this, 5, nullptr, 1);
 
@@ -348,16 +361,10 @@ class UsbBridgeComponent : public Component {
 
   // ── USB Host Library daemon ───────────────────────────────
   static void usb_lib_task_(void *arg) {
-    BRIDGE_LOG("[usb_lib] task started on core %d", xPortGetCoreID());
     while (true) {
       uint32_t event_flags = 0;
-      esp_err_t err = usb_host_lib_handle_events(pdMS_TO_TICKS(5000), &event_flags);
-      if (err == ESP_OK && event_flags != 0) {
-        BRIDGE_LOG("[usb_lib] event_flags=0x%lx", (unsigned long)event_flags);
-      } else if (err == ESP_ERR_TIMEOUT) {
-        BRIDGE_LOG("[usb_lib] no events for 5s (waiting...)");
-      } else if (err != ESP_OK) {
-        BRIDGE_LOGW("[usb_lib] handle_events error: %s", esp_err_to_name(err));
+      esp_err_t err = usb_host_lib_handle_events(portMAX_DELAY, &event_flags);
+      if (err != ESP_OK) {
         vTaskDelay(pdMS_TO_TICKS(100));
       }
     }
