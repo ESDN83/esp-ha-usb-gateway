@@ -27,7 +27,7 @@ namespace esphome {
 namespace usb_bridge {
 
 static const char *const TAG = "usb_bridge";
-static const char *const FW_BUILD_ID = "usb-bridge build 2026-04-01-d";
+static const char *const FW_BUILD_ID = "usb-bridge build 2026-04-01-e";
 
 // Known USB serial chip vendors
 static constexpr uint16_t FTDI_VID = 0x0403;
@@ -235,23 +235,24 @@ class UsbBridgeComponent : public Component {
     ctrl_xfer_done_ = xSemaphoreCreateBinary();
     new_dev_queue_ = xQueueCreate(8, sizeof(uint8_t));
 
-    // Cold boot: ESP + hub power up together. Hub needs ~2-3s to initialize.
-    // SE0 pulse before hub is ready has no effect (hub isn't tracking the port yet).
-    // Warm reboot: hub keeps power, is already running — SE0 works immediately.
-    // Strategy: wait for hub to be up first, THEN send SE0 disconnect signal.
+    // USB reset sequence:
+    // 1. Wait 3s for hub to finish cold-boot (on power cycle, hub starts with ESP)
+    // 2. SE0 pulse: D+/D- LOW = USB disconnect signal (hub drops root port)
+    // 3. IMMEDIATELY run usb_host_install() → PHY pulls D+ HIGH → hub sees
+    //    fresh connect → enumerates all downstream devices
+    // KEY: No gap between SE0 release and PHY init! Floating pins = no valid
+    //    USB state. The hub needs to see SE0→J-state transition cleanly.
     BRIDGE_LOG("Waiting 3s for USB hub cold-boot init...");
     vTaskDelay(pdMS_TO_TICKS(3000));
-    BRIDGE_LOG("USB SE0 reset pulse 1: GPIO19/20 LOW 150ms...");
-    phy_se0_pulse_ms_(150);
-    vTaskDelay(pdMS_TO_TICKS(500));
-    BRIDGE_LOG("USB SE0 reset pulse 2: GPIO19/20 LOW 150ms...");
-    phy_se0_pulse_ms_(150);
-    BRIDGE_LOG("Waiting 3s for hub re-enumeration...");
-    vTaskDelay(pdMS_TO_TICKS(3000));
 
+    BRIDGE_LOG("USB SE0 disconnect pulse: GPIO19/20 LOW 200ms...");
+    phy_se0_pulse_ms_(200);
+
+    // Load NVS config while GPIO pins float (minimal delay before PHY init)
     load_nvs_config_();
     BRIDGE_LOG("Loaded %zu saved device configs from NVS", connections_.size());
 
+    // Install USB host IMMEDIATELY after SE0 — PHY pulls D+ HIGH, hub sees connect
     const usb_host_config_t host_config = {
         .skip_phy_setup = false,
         .intr_flags = ESP_INTR_FLAG_LEVEL1,
@@ -263,7 +264,7 @@ class UsbBridgeComponent : public Component {
       this->mark_failed();
       return;
     }
-    BRIDGE_LOG("USB Host installed (SE0 reset done, enum_filter=allow_all)");
+    BRIDGE_LOG("USB Host installed — PHY active, hub should see connect now");
 
     const usb_host_client_config_t client_config = {
         .is_synchronous = false,
