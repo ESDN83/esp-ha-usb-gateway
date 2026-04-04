@@ -157,6 +157,7 @@ struct DeviceConfig {
   bool autoboot;
   char name[32];
   char serial[64];
+  char allowed_ips[128];
 };
 
 class UsbBridgeComponent;
@@ -444,6 +445,7 @@ class UsbBridgeComponent : public Component {
       conn->config.autoboot = s.autoboot;
       strncpy(conn->config.name, s.name, sizeof(conn->config.name) - 1);
       strncpy(conn->config.serial, s.serial, sizeof(conn->config.serial) - 1);
+      strncpy(conn->config.allowed_ips, s.allowed_ips, sizeof(conn->config.allowed_ips) - 1);
       conn->parent = this;
       conn->usb_mutex = xSemaphoreCreateMutex();
       connections_.push_back(conn);
