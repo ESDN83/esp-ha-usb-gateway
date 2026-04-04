@@ -1079,7 +1079,7 @@ class UsbBridgeComponent : public Component {
     // Binary sensor: bridge online
     snprintf(topic, sizeof(topic), "homeassistant/binary_sensor/usb_bridge_%s/online/config", uid);
     snprintf(payload, sizeof(payload),
-      "{\"name\":\"USB Bridge Online\",\"uniq_id\":\"usb_bridge_%s_online\","
+      "{\"name\":\"Online\",\"uniq_id\":\"usb_bridge_%s_online\","
       "\"stat_t\":\"usb_bridge_%s/available\",\"pl_on\":\"online\",\"pl_off\":\"offline\","
       "\"dev_cla\":\"connectivity\","
       "\"dev\":{\"ids\":[\"usb_bridge_%s\"],\"name\":\"USB TCP Bridge\",\"mf\":\"ESP32-S3\",\"mdl\":\"USB Gateway\",\"sw\":\"%s\"}}",
@@ -1089,7 +1089,7 @@ class UsbBridgeComponent : public Component {
     // Sensor: connected device count
     snprintf(topic, sizeof(topic), "homeassistant/sensor/usb_bridge_%s/devices/config", uid);
     snprintf(payload, sizeof(payload),
-      "{\"name\":\"USB Devices Connected\",\"uniq_id\":\"usb_bridge_%s_devices\","
+      "{\"name\":\"Devices Connected\",\"uniq_id\":\"usb_bridge_%s_devices\","
       "\"stat_t\":\"usb_bridge_%s/state\",\"val_tpl\":\"{{value_json.devices_connected}}\","
       "\"ic\":\"mdi:usb\","
       "\"dev\":{\"ids\":[\"usb_bridge_%s\"]}}",
@@ -1099,7 +1099,7 @@ class UsbBridgeComponent : public Component {
     // Sensor: firmware
     snprintf(topic, sizeof(topic), "homeassistant/sensor/usb_bridge_%s/firmware/config", uid);
     snprintf(payload, sizeof(payload),
-      "{\"name\":\"USB Bridge Firmware\",\"uniq_id\":\"usb_bridge_%s_fw\","
+      "{\"name\":\"Firmware\",\"uniq_id\":\"usb_bridge_%s_fw\","
       "\"stat_t\":\"usb_bridge_%s/state\",\"val_tpl\":\"{{value_json.firmware}}\","
       "\"ic\":\"mdi:chip\",\"ent_cat\":\"diagnostic\","
       "\"dev\":{\"ids\":[\"usb_bridge_%s\"]}}",
@@ -1109,7 +1109,7 @@ class UsbBridgeComponent : public Component {
     // Sensor: uptime
     snprintf(topic, sizeof(topic), "homeassistant/sensor/usb_bridge_%s/uptime/config", uid);
     snprintf(payload, sizeof(payload),
-      "{\"name\":\"USB Bridge Uptime\",\"uniq_id\":\"usb_bridge_%s_uptime\","
+      "{\"name\":\"Uptime\",\"uniq_id\":\"usb_bridge_%s_uptime\","
       "\"stat_t\":\"usb_bridge_%s/state\",\"val_tpl\":\"{{value_json.uptime}}\","
       "\"unit_of_meas\":\"s\",\"ic\":\"mdi:timer-outline\",\"ent_cat\":\"diagnostic\","
       "\"dev\":{\"ids\":[\"usb_bridge_%s\"]}}",
@@ -1119,7 +1119,7 @@ class UsbBridgeComponent : public Component {
     // Button: restart
     snprintf(topic, sizeof(topic), "homeassistant/button/usb_bridge_%s/restart/config", uid);
     snprintf(payload, sizeof(payload),
-      "{\"name\":\"USB Bridge Restart\",\"uniq_id\":\"usb_bridge_%s_restart\","
+      "{\"name\":\"Restart\",\"uniq_id\":\"usb_bridge_%s_restart\","
       "\"cmd_t\":\"usb_bridge_%s/restart\",\"ic\":\"mdi:restart\","
       "\"dev\":{\"ids\":[\"usb_bridge_%s\"]}}",
       uid, uid, uid);
