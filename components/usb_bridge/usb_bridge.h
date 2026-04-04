@@ -14,6 +14,8 @@
 #include "esp_netif.h"
 #include "esp_system.h"
 #include "esp_ota_ops.h"
+#include "esp_mac.h"
+#include "mqtt_client.h"
 
 #include <atomic>
 #include <cstring>
@@ -25,7 +27,7 @@ namespace esphome {
 namespace usb_bridge {
 
 static const char *const TAG = "usb_bridge";
-static const char *const FW_BUILD_ID = "usb-bridge build 2026-04-01-f";
+static const char *const FW_BUILD_ID = "usb-bridge build 2026-04-03-a";
 
 // Known USB serial chip vendors
 static constexpr uint16_t FTDI_VID = 0x0403;
@@ -196,6 +198,7 @@ class UsbBridgeComponent : public Component {
   std::vector<DeviceConnection*>& get_connections() { return connections_; }
   std::vector<DiscoveredDevice>& get_discovered() { return discovered_; }
   SemaphoreHandle_t get_discovery_mutex() { return discovery_mutex_; }
+  const BridgeSettings& get_settings() { return settings_; }
 
   float get_setup_priority() const override {
     return setup_priority::AFTER_WIFI;
@@ -221,6 +224,18 @@ class UsbBridgeComponent : public Component {
 
     load_nvs_config_();
     BRIDGE_LOG("Loaded %zu saved device configs from NVS", connections_.size());
+
+    // Load bridge settings (password, IP whitelist, MQTT)
+    nvs_load_settings(settings_);
+    if (settings_.allowed_ips[0])
+      BRIDGE_LOG("IP whitelist: %s", settings_.allowed_ips);
+    else
+      BRIDGE_LOG("IP whitelist: disabled (all IPs allowed)");
+
+    // Generate unique MQTT ID from MAC
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    snprintf(mqtt_uid_, sizeof(mqtt_uid_), "%02x%02x%02x", mac[3], mac[4], mac[5]);
 
     // Install USB host — IDF handles PHY init and root port reset internally
     const usb_host_config_t host_config = {
@@ -264,6 +279,11 @@ class UsbBridgeComponent : public Component {
 
     BRIDGE_LOG("USB TCP Gateway ready — config UI at http://<ip>/");
     BRIDGE_LOG("NOTE: ESP32-S3 has 8 HCD channels. With hub, max 2 serial devices can be active.");
+
+    // Start MQTT if enabled
+    if (settings_.mqtt_enabled && settings_.mqtt_host[0]) {
+      mqtt_init_();
+    }
   }
 
   void loop() override {
@@ -312,6 +332,12 @@ class UsbBridgeComponent : public Component {
         BRIDGE_LOG("USB host reinstalled — waiting for devices (cold boot retry)");
       }
     }
+
+    // MQTT periodic state publish (every 30s)
+    if (mqtt_client_ && millis() - last_mqtt_publish_ > 30000) {
+      last_mqtt_publish_ = millis();
+      mqtt_publish_state_();
+    }
   }
 
   // Called from web UI to save config and reboot
@@ -347,6 +373,28 @@ class UsbBridgeComponent : public Component {
     return false;
   }
 
+  // Clean reboot with USB shutdown (used by MQTT restart and web UI reboot task)
+  void clean_reboot_() {
+    BRIDGE_LOG("Clean reboot — shutting down USB...");
+    for (auto *conn : connections_) {
+      if (conn->dev_hdl) {
+        conn->connected.store(false);
+        usb_host_interface_release(client_hdl_, conn->dev_hdl, conn->claimed_intf);
+        usb_host_device_close(client_hdl_, conn->dev_hdl);
+        conn->dev_hdl = nullptr;
+      }
+    }
+    if (client_hdl_) {
+      usb_host_client_deregister(client_hdl_);
+      client_hdl_ = nullptr;
+    }
+    uint32_t flags = 0;
+    usb_host_lib_handle_events(pdMS_TO_TICKS(100), &flags);
+    usb_host_uninstall();
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+  }
+
  private:
   static UsbBridgeComponent *instance_;
 
@@ -356,6 +404,11 @@ class UsbBridgeComponent : public Component {
   bool cold_boot_retry_done_{false};
 
   usb_host_client_handle_t client_hdl_{nullptr};
+
+  BridgeSettings settings_{};
+  esp_mqtt_client_handle_t mqtt_client_{nullptr};
+  char mqtt_uid_[16]{};
+  uint32_t last_mqtt_publish_{0};
 
   SemaphoreHandle_t ctrl_xfer_done_{nullptr};
   usb_transfer_status_t ctrl_xfer_status_{};
@@ -954,6 +1007,156 @@ class UsbBridgeComponent : public Component {
   }
 
   // ── TCP server per device ─────────────────────────────────
+  // ── MQTT ──────────────────────────────────────────────────
+  static void mqtt_event_handler_(void *arg, esp_event_base_t base, int32_t id, void *data) {
+    auto *self = static_cast<UsbBridgeComponent *>(arg);
+    auto *event = static_cast<esp_mqtt_event_handle_t>(data);
+    switch (id) {
+      case MQTT_EVENT_CONNECTED:
+        BRIDGE_LOG("MQTT connected");
+        self->mqtt_publish_discovery_();
+        self->mqtt_publish_state_();
+        // Publish online availability
+        {
+          char topic[64];
+          snprintf(topic, sizeof(topic), "usb_bridge_%s/available", self->mqtt_uid_);
+          esp_mqtt_client_publish(self->mqtt_client_, topic, "online", 0, 1, 1);
+        }
+        // Subscribe to restart command
+        {
+          char topic[64];
+          snprintf(topic, sizeof(topic), "usb_bridge_%s/restart", self->mqtt_uid_);
+          esp_mqtt_client_subscribe(self->mqtt_client_, topic, 0);
+        }
+        break;
+      case MQTT_EVENT_DATA:
+        // Handle restart command
+        if (event->topic_len > 0) {
+          char topic[64];
+          snprintf(topic, sizeof(topic), "usb_bridge_%s/restart", self->mqtt_uid_);
+          if (strncmp(event->topic, topic, event->topic_len) == 0) {
+            BRIDGE_LOG("MQTT restart command received");
+            self->clean_reboot_();
+          }
+        }
+        break;
+      case MQTT_EVENT_DISCONNECTED:
+        BRIDGE_LOGW("MQTT disconnected");
+        break;
+      default: break;
+    }
+  }
+
+  void mqtt_init_() {
+    char uri[96];
+    snprintf(uri, sizeof(uri), "mqtt://%s:%d", settings_.mqtt_host, settings_.mqtt_port);
+
+    char lwt_topic[64];
+    snprintf(lwt_topic, sizeof(lwt_topic), "usb_bridge_%s/available", mqtt_uid_);
+
+    esp_mqtt_client_config_t cfg = {};
+    cfg.broker.address.uri = uri;
+    if (settings_.mqtt_user[0]) cfg.credentials.username = settings_.mqtt_user;
+    if (settings_.mqtt_password[0]) cfg.credentials.authentication.password = settings_.mqtt_password;
+    cfg.session.last_will.topic = lwt_topic;
+    cfg.session.last_will.msg = "offline";
+    cfg.session.last_will.msg_len = 7;
+    cfg.session.last_will.qos = 1;
+    cfg.session.last_will.retain = 1;
+
+    mqtt_client_ = esp_mqtt_client_init(&cfg);
+    if (!mqtt_client_) { BRIDGE_LOGE("MQTT client init failed"); return; }
+    esp_mqtt_client_register_event(mqtt_client_, (esp_mqtt_event_id_t)ESP_EVENT_ANY_ID, mqtt_event_handler_, this);
+    esp_mqtt_client_start(mqtt_client_);
+    BRIDGE_LOG("MQTT starting → %s", uri);
+  }
+
+  void mqtt_publish_discovery_() {
+    if (!mqtt_client_) return;
+    char topic[128], payload[512];
+    const char *uid = mqtt_uid_;
+
+    // Binary sensor: bridge online
+    snprintf(topic, sizeof(topic), "homeassistant/binary_sensor/usb_bridge_%s/online/config", uid);
+    snprintf(payload, sizeof(payload),
+      "{\"name\":\"USB Bridge Online\",\"uniq_id\":\"usb_bridge_%s_online\","
+      "\"stat_t\":\"usb_bridge_%s/available\",\"pl_on\":\"online\",\"pl_off\":\"offline\","
+      "\"dev_cla\":\"connectivity\","
+      "\"dev\":{\"ids\":[\"usb_bridge_%s\"],\"name\":\"USB TCP Bridge\",\"mf\":\"ESP32-S3\",\"mdl\":\"USB Gateway\",\"sw\":\"%s\"}}",
+      uid, uid, uid, FW_BUILD_ID);
+    esp_mqtt_client_publish(mqtt_client_, topic, payload, 0, 1, 1);
+
+    // Sensor: connected device count
+    snprintf(topic, sizeof(topic), "homeassistant/sensor/usb_bridge_%s/devices/config", uid);
+    snprintf(payload, sizeof(payload),
+      "{\"name\":\"USB Devices Connected\",\"uniq_id\":\"usb_bridge_%s_devices\","
+      "\"stat_t\":\"usb_bridge_%s/state\",\"val_tpl\":\"{{value_json.devices_connected}}\","
+      "\"ic\":\"mdi:usb\","
+      "\"dev\":{\"ids\":[\"usb_bridge_%s\"]}}",
+      uid, uid, uid);
+    esp_mqtt_client_publish(mqtt_client_, topic, payload, 0, 1, 1);
+
+    // Sensor: firmware
+    snprintf(topic, sizeof(topic), "homeassistant/sensor/usb_bridge_%s/firmware/config", uid);
+    snprintf(payload, sizeof(payload),
+      "{\"name\":\"USB Bridge Firmware\",\"uniq_id\":\"usb_bridge_%s_fw\","
+      "\"stat_t\":\"usb_bridge_%s/state\",\"val_tpl\":\"{{value_json.firmware}}\","
+      "\"ic\":\"mdi:chip\",\"ent_cat\":\"diagnostic\","
+      "\"dev\":{\"ids\":[\"usb_bridge_%s\"]}}",
+      uid, uid, uid);
+    esp_mqtt_client_publish(mqtt_client_, topic, payload, 0, 1, 1);
+
+    // Sensor: uptime
+    snprintf(topic, sizeof(topic), "homeassistant/sensor/usb_bridge_%s/uptime/config", uid);
+    snprintf(payload, sizeof(payload),
+      "{\"name\":\"USB Bridge Uptime\",\"uniq_id\":\"usb_bridge_%s_uptime\","
+      "\"stat_t\":\"usb_bridge_%s/state\",\"val_tpl\":\"{{value_json.uptime}}\","
+      "\"unit_of_meas\":\"s\",\"ic\":\"mdi:timer-outline\",\"ent_cat\":\"diagnostic\","
+      "\"dev\":{\"ids\":[\"usb_bridge_%s\"]}}",
+      uid, uid, uid);
+    esp_mqtt_client_publish(mqtt_client_, topic, payload, 0, 1, 1);
+
+    // Button: restart
+    snprintf(topic, sizeof(topic), "homeassistant/button/usb_bridge_%s/restart/config", uid);
+    snprintf(payload, sizeof(payload),
+      "{\"name\":\"USB Bridge Restart\",\"uniq_id\":\"usb_bridge_%s_restart\","
+      "\"cmd_t\":\"usb_bridge_%s/restart\",\"ic\":\"mdi:restart\","
+      "\"dev\":{\"ids\":[\"usb_bridge_%s\"]}}",
+      uid, uid, uid);
+    esp_mqtt_client_publish(mqtt_client_, topic, payload, 0, 1, 1);
+
+    BRIDGE_LOG("MQTT HA discovery published (%s)", uid);
+  }
+
+  void mqtt_publish_state_() {
+    if (!mqtt_client_) return;
+    char topic[64], payload[512];
+    snprintf(topic, sizeof(topic), "usb_bridge_%s/state", mqtt_uid_);
+
+    int dev_connected = 0;
+    for (auto *c : connections_) {
+      if (c->connected.load()) dev_connected++;
+    }
+
+    char *p = payload;
+    const char *end = payload + sizeof(payload) - 2;
+    p += snprintf(p, end - p,
+      "{\"online\":true,\"firmware\":\"%s\",\"uptime\":%lu,\"devices_connected\":%d,"
+      "\"devices_configured\":%zu,\"free_heap\":%lu,\"devices\":[",
+      FW_BUILD_ID, (unsigned long)(millis() / 1000), dev_connected,
+      connections_.size(), (unsigned long)esp_get_free_heap_size());
+
+    for (size_t i = 0; i < connections_.size() && p < end - 100; i++) {
+      if (i > 0) *p++ = ',';
+      p += snprintf(p, end - p, "{\"name\":\"%s\",\"port\":%d,\"connected\":%s}",
+                    connections_[i]->config.name, connections_[i]->config.port,
+                    connections_[i]->connected.load() ? "true" : "false");
+    }
+    p += snprintf(p, end - p, "]}");
+
+    esp_mqtt_client_publish(mqtt_client_, topic, payload, 0, 0, 0);
+  }
+
   static void tcp_task_entry_(void *arg) {
     auto *conn = static_cast<DeviceConnection *>(arg);
     conn->parent->tcp_task_(conn);
@@ -994,6 +1197,15 @@ class UsbBridgeComponent : public Component {
 
         char as[INET_ADDRSTRLEN];
         inet_ntoa_r(ca.sin_addr, as, sizeof(as));
+
+        // IP whitelist check
+        if (!is_ip_allowed(as, settings_.allowed_ips)) {
+          BRIDGE_LOGW("TCP connection REJECTED from %s on port %d (not in whitelist)",
+                     as, conn->config.port);
+          lwip_close(cfd);
+          continue;
+        }
+
         BRIDGE_LOG("TCP client connected on port %d from %s (device: %s, usb_connected=%d)",
                  conn->config.port, as, conn->config.name, conn->connected.load());
 
@@ -1106,6 +1318,9 @@ static esp_err_t handle_post_config_(httpd_req_t *req) {
   auto *comp = web_ctx_.component;
   if (!comp) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No component"); return ESP_FAIL; }
 
+  // Auth check
+  if (!check_admin_auth_(req, comp->get_settings().admin_password)) return ESP_OK;
+
   int total_len = req->content_len;
   if (total_len > 4096) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Too large"); return ESP_FAIL; }
 
@@ -1164,8 +1379,11 @@ static esp_err_t handle_post_config_(httpd_req_t *req) {
     httpd_resp_sendstr(req, "{\"message\":\"Config saved! Rebooting...\",\"ok\":true}");
   }
 
-  xTaskCreate([](void *) { vTaskDelay(pdMS_TO_TICKS(1500)); esp_restart(); },
-              "reboot", 2048, nullptr, 1, nullptr);
+  xTaskCreate([](void *arg) {
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    auto *c = static_cast<UsbBridgeComponent *>(arg);
+    c->clean_reboot_();
+  }, "reboot", 4096, comp, 1, nullptr);
   return ESP_OK;
 }
 

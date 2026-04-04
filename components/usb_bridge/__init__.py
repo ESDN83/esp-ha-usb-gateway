@@ -1,7 +1,7 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome.const import CONF_ID
-from esphome.components.esp32 import add_idf_sdkconfig_option
+from esphome.components.esp32 import add_idf_sdkconfig_option, include_builtin_idf_component
 
 DEPENDENCIES = ["network"]
 CODEOWNERS = []
@@ -38,3 +38,7 @@ async def to_code(config):
     # PSRAM can cause USB host interrupts to be missed (ESP-IDF #9519).
     add_idf_sdkconfig_option("CONFIG_SPIRAM", False)
     add_idf_sdkconfig_option("CONFIG_ESP32S3_SPIRAM_SUPPORT", False)
+
+    # MQTT client for HA discovery — ESPHome excludes IDF mqtt component by default
+    include_builtin_idf_component("mqtt")
+    add_idf_sdkconfig_option("CONFIG_MQTT_PROTOCOL_311", True)

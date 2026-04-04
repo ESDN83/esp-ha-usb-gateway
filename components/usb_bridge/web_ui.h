@@ -90,6 +90,65 @@ static bool nvs_save_devices(const std::vector<StoredDeviceConfig> &devs) {
   return true;
 }
 
+// ── Bridge Settings (password, IP whitelist, MQTT) ──────────
+struct BridgeSettings {
+  char admin_password[32];
+  char allowed_ips[256];   // comma-separated, empty = all allowed
+  char mqtt_host[64];
+  uint16_t mqtt_port;
+  char mqtt_user[32];
+  char mqtt_password[64];
+  uint8_t mqtt_enabled;
+  uint8_t _pad[3];
+};
+
+static bool nvs_load_settings(BridgeSettings &s) {
+  memset(&s, 0, sizeof(s));
+  s.mqtt_port = 1883;
+  nvs_handle_t h;
+  if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) return false;
+  size_t len = sizeof(s);
+  bool ok = (nvs_get_blob(h, "settings", &s, &len) == ESP_OK);
+  nvs_close(h);
+  return ok;
+}
+
+static bool nvs_save_settings(const BridgeSettings &s) {
+  nvs_handle_t h;
+  if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return false;
+  nvs_set_blob(h, "settings", &s, sizeof(s));
+  nvs_commit(h);
+  nvs_close(h);
+  ESP_LOGI(WEB_TAG, "Settings saved to NVS");
+  return true;
+}
+
+static bool is_ip_allowed(const char *ip, const char *allowed_list) {
+  if (!allowed_list || !allowed_list[0]) return true;
+  char list[256];
+  strncpy(list, allowed_list, sizeof(list) - 1);
+  list[sizeof(list) - 1] = 0;
+  char *token = strtok(list, ", ");
+  while (token) {
+    if (strcmp(token, ip) == 0) return true;
+    token = strtok(nullptr, ", ");
+  }
+  return false;
+}
+
+static bool check_admin_auth_(httpd_req_t *req, const char *required_password) {
+  if (!required_password || required_password[0] == '\0') return true;
+  char pw_header[64] = {};
+  if (httpd_req_get_hdr_value_str(req, "X-Admin-Password", pw_header, sizeof(pw_header)) != ESP_OK ||
+      strcmp(pw_header, required_password) != 0) {
+    httpd_resp_set_status(req, "401 Unauthorized");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"error\":\"Invalid password\"}");
+    return false;
+  }
+  return true;
+}
+
 // ── Minimal JSON helpers ────────────────────────────────────
 static void json_append_str(char *&p, const char *end, const char *key, const char *val, bool comma = true) {
   p += snprintf(p, end - p, "\"%s\":\"%s\"%s", key, val, comma ? "," : "");
@@ -191,6 +250,26 @@ input:focus{border-color:#4fc3f7;outline:none}
 <div id="logbox">Loading...</div>
 <div class="toolbar">
 <button class="btn btn-secondary" onclick="loadLog()">Refresh Log</button>
+</div>
+
+<h2>Settings</h2>
+<div class="card" id="settings-panel">
+<div class="row">
+<div><label>Admin Password</label><input type="password" id="s_password" placeholder="(none = open)"></div>
+<div><label>Allowed IPs</label><input type="text" id="s_allowed_ips" placeholder="empty = all allowed" title="Comma-separated IPs for TCP serial access"></div>
+</div>
+<div class="row">
+<div><label>MQTT Host</label><input type="text" id="s_mqtt_host" placeholder="192.168.1.x"></div>
+<div><label>MQTT Port</label><input type="number" id="s_mqtt_port" value="1883" min="1" max="65535"></div>
+</div>
+<div class="row">
+<div><label>MQTT User</label><input type="text" id="s_mqtt_user" placeholder="(optional)"></div>
+<div><label>MQTT Password</label><input type="password" id="s_mqtt_pass" placeholder="(optional)"></div>
+<div class="chk"><input type="checkbox" id="s_mqtt_en"><label for="s_mqtt_en" style="color:#e0e0e0">MQTT enabled</label></div>
+</div>
+<div class="toolbar">
+<button class="btn btn-primary" onclick="saveSettings()">Save Settings</button>
+</div>
 </div>
 
 <div id="toast" class="toast"></div>
@@ -308,19 +387,53 @@ function refreshStatus(){
   }).catch(e=>toast('Refresh failed: '+e,true));
 }
 
+function getPassword(){return document.getElementById('s_password').value||''}
+
 function saveConfig(){
   const body=JSON.stringify(configs.map(d=>({
     name:d.name,vid:d.vid,pid:d.pid,serial:d.serial||'',
     port:d.port,baud_rate:d.baud_rate,interface:d.interface||0,autoboot:!!d.autoboot
   })));
-  fetch('/api/usb/config',{method:'POST',headers:{'Content-Type':'application/json'},body})
-    .then(r=>{if(!r.ok)throw new Error(r.status);return r.json()})
+  const hdrs={'Content-Type':'application/json'};
+  const pw=getPassword();if(pw)hdrs['X-Admin-Password']=pw;
+  fetch('/api/usb/config',{method:'POST',headers:hdrs,body})
+    .then(r=>{if(r.status===401)throw new Error('Wrong password');if(!r.ok)throw new Error(r.status);return r.json()})
     .then(d=>{
       dirty=false;
       toast(d.message||'Saved!');
       setTimeout(()=>location.reload(),10000);
     })
     .catch(e=>toast('Save failed: '+e,true));
+}
+
+function loadSettings(){
+  fetch('/api/usb/settings').then(r=>r.json()).then(s=>{
+    document.getElementById('s_password').value=s.password||'';
+    document.getElementById('s_allowed_ips').value=s.allowed_ips||'';
+    document.getElementById('s_mqtt_host').value=s.mqtt_host||'';
+    document.getElementById('s_mqtt_port').value=s.mqtt_port||1883;
+    document.getElementById('s_mqtt_user').value=s.mqtt_user||'';
+    document.getElementById('s_mqtt_pass').value=s.mqtt_pass||'';
+    document.getElementById('s_mqtt_en').checked=!!s.mqtt_enabled;
+  }).catch(()=>{});
+}
+
+function saveSettings(){
+  const body=JSON.stringify({
+    password:document.getElementById('s_password').value,
+    allowed_ips:document.getElementById('s_allowed_ips').value,
+    mqtt_host:document.getElementById('s_mqtt_host').value,
+    mqtt_port:parseInt(document.getElementById('s_mqtt_port').value)||1883,
+    mqtt_user:document.getElementById('s_mqtt_user').value,
+    mqtt_pass:document.getElementById('s_mqtt_pass').value,
+    mqtt_enabled:document.getElementById('s_mqtt_en').checked
+  });
+  const hdrs={'Content-Type':'application/json'};
+  const pw=getPassword();if(pw)hdrs['X-Admin-Password']=pw;
+  fetch('/api/usb/settings',{method:'POST',headers:hdrs,body})
+    .then(r=>{if(r.status===401)throw new Error('Wrong password');if(!r.ok)throw new Error(r.status);return r.json()})
+    .then(d=>toast(d.message||'Settings saved!'))
+    .catch(e=>toast('Settings save failed: '+e,true));
 }
 
 function loadLog(){
@@ -334,6 +447,7 @@ function loadLog(){
 // Initial load
 loadAll();
 loadLog();
+loadSettings();
 
 // Auto-refresh status (don't overwrite local unsaved config changes)
 setInterval(()=>{
@@ -375,6 +489,60 @@ static esp_err_t handle_post_config_(httpd_req_t *req);
 static esp_err_t handle_get_status_(httpd_req_t *req);
 static esp_err_t handle_get_log_(httpd_req_t *req);
 
+// Settings handlers (self-contained, no component access needed)
+static esp_err_t handle_get_settings_(httpd_req_t *req) {
+  BridgeSettings s;
+  nvs_load_settings(s);
+  char buf[512]; char *p = buf; const char *end = buf + sizeof(buf) - 2;
+  *p++ = '{';
+  json_append_str(p, end, "password", s.admin_password);
+  json_append_str(p, end, "allowed_ips", s.allowed_ips);
+  json_append_str(p, end, "mqtt_host", s.mqtt_host);
+  json_append_int(p, end, "mqtt_port", s.mqtt_port);
+  json_append_str(p, end, "mqtt_user", s.mqtt_user);
+  json_append_str(p, end, "mqtt_pass", s.mqtt_password);
+  json_append_bool(p, end, "mqtt_enabled", s.mqtt_enabled, false);
+  *p++ = '}'; *p = 0;
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_send(req, buf, p - buf);
+  return ESP_OK;
+}
+
+static esp_err_t handle_post_settings_(httpd_req_t *req) {
+  // Check auth with current password
+  BridgeSettings cur;
+  nvs_load_settings(cur);
+  if (!check_admin_auth_(req, cur.admin_password)) return ESP_OK;
+
+  int total_len = req->content_len;
+  if (total_len > 1024) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Too large"); return ESP_FAIL; }
+  char *body = (char *)malloc(total_len + 1);
+  if (!body) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM"); return ESP_FAIL; }
+  int received = 0;
+  while (received < total_len) {
+    int ret = httpd_req_recv(req, body + received, total_len - received);
+    if (ret <= 0) { free(body); return ESP_FAIL; }
+    received += ret;
+  }
+  body[total_len] = 0;
+
+  BridgeSettings s;
+  memset(&s, 0, sizeof(s));
+  json_get_str(body, "password", s.admin_password, sizeof(s.admin_password));
+  json_get_str(body, "allowed_ips", s.allowed_ips, sizeof(s.allowed_ips));
+  json_get_str(body, "mqtt_host", s.mqtt_host, sizeof(s.mqtt_host));
+  s.mqtt_port = json_get_int(body, "mqtt_port", 1883);
+  json_get_str(body, "mqtt_user", s.mqtt_user, sizeof(s.mqtt_user));
+  json_get_str(body, "mqtt_pass", s.mqtt_password, sizeof(s.mqtt_password));
+  s.mqtt_enabled = json_get_bool(body, "mqtt_enabled", false) ? 1 : 0;
+  free(body);
+
+  nvs_save_settings(s);
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_sendstr(req, "{\"message\":\"Settings saved! Reboot to apply MQTT changes.\",\"ok\":true}");
+  return ESP_OK;
+}
+
 static httpd_handle_t start_config_webserver_(int port) {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = port;
@@ -393,12 +561,16 @@ static httpd_handle_t start_config_webserver_(int port) {
   httpd_uri_t post_cfg = {.uri = "/api/usb/config", .method = HTTP_POST, .handler = handle_post_config_, .user_ctx = nullptr};
   httpd_uri_t get_st = {.uri = "/api/usb/status", .method = HTTP_GET, .handler = handle_get_status_, .user_ctx = nullptr};
   httpd_uri_t get_log = {.uri = "/api/usb/log", .method = HTTP_GET, .handler = handle_get_log_, .user_ctx = nullptr};
+  httpd_uri_t get_set = {.uri = "/api/usb/settings", .method = HTTP_GET, .handler = handle_get_settings_, .user_ctx = nullptr};
+  httpd_uri_t post_set = {.uri = "/api/usb/settings", .method = HTTP_POST, .handler = handle_post_settings_, .user_ctx = nullptr};
 
   httpd_register_uri_handler(server, &root);
   httpd_register_uri_handler(server, &get_cfg);
   httpd_register_uri_handler(server, &post_cfg);
   httpd_register_uri_handler(server, &get_st);
   httpd_register_uri_handler(server, &get_log);
+  httpd_register_uri_handler(server, &get_set);
+  httpd_register_uri_handler(server, &post_set);
 
   ESP_LOGI(WEB_TAG, "Config UI at http://<ip>:%d/", port);
   return server;
