@@ -18,7 +18,7 @@ static const char *const WEB_TAG = "usb_web";
 static constexpr const char *NVS_NAMESPACE = "usb_bridge";
 static constexpr const char *NVS_KEY_COUNT = "dev_count";
 static constexpr const char *NVS_KEY_VERSION = "cfg_ver";
-static constexpr uint8_t NVS_CFG_VERSION = 2;  // v2: added serial field
+static constexpr uint8_t NVS_CFG_VERSION = 3;  // v3: added per-device allowed_ips
 static constexpr size_t MAX_DEVICES = 8;
 
 struct StoredDeviceConfig {
@@ -30,6 +30,7 @@ struct StoredDeviceConfig {
   uint8_t interface;
   uint8_t autoboot;
   char serial[64];
+  char allowed_ips[128];  // per-device IP whitelist, comma-separated
 };
 
 static bool nvs_load_devices(std::vector<StoredDeviceConfig> &out) {
@@ -93,13 +94,14 @@ static bool nvs_save_devices(const std::vector<StoredDeviceConfig> &devs) {
 // ── Bridge Settings (password, IP whitelist, MQTT) ──────────
 struct BridgeSettings {
   char admin_password[32];
-  char allowed_ips[256];   // comma-separated, empty = all allowed
+  char _reserved[256];     // was: global allowed_ips (now per-device)
   char mqtt_host[64];
   uint16_t mqtt_port;
   char mqtt_user[32];
   char mqtt_password[64];
   uint8_t mqtt_enabled;
-  uint8_t _pad[3];
+  uint8_t mqtt_discovery;   // HA MQTT auto-discovery
+  uint8_t _pad[2];
 };
 
 static bool nvs_load_settings(BridgeSettings &s) {
@@ -256,7 +258,6 @@ input:focus{border-color:#4fc3f7;outline:none}
 <div class="card" id="settings-panel">
 <div class="row">
 <div><label>Admin Password</label><input type="password" id="s_password" placeholder="(none = open)"></div>
-<div><label>Allowed IPs</label><input type="text" id="s_allowed_ips" placeholder="empty = all allowed" title="Comma-separated IPs for TCP serial access"></div>
 </div>
 <div class="row">
 <div><label>MQTT Host</label><input type="text" id="s_mqtt_host" placeholder="192.168.1.x"></div>
@@ -266,6 +267,7 @@ input:focus{border-color:#4fc3f7;outline:none}
 <div><label>MQTT User</label><input type="text" id="s_mqtt_user" placeholder="(optional)"></div>
 <div><label>MQTT Password</label><input type="password" id="s_mqtt_pass" placeholder="(optional)"></div>
 <div class="chk"><input type="checkbox" id="s_mqtt_en"><label for="s_mqtt_en" style="color:#e0e0e0">MQTT enabled</label></div>
+<div class="chk"><input type="checkbox" id="s_mqtt_disc"><label for="s_mqtt_disc" style="color:#e0e0e0">HA Auto Discovery</label></div>
 </div>
 <div class="toolbar">
 <button class="btn btn-primary" onclick="saveSettings()">Save Settings</button>
@@ -334,6 +336,9 @@ function renderConfigs(){
         <div><label>Interface</label><input type="number" value="${d.interface||0}" onchange="configs[${i}].interface=parseInt(this.value)||0;dirty=true" min="0" max="10"></div>
         <div class="chk"><input type="checkbox" id="ab${i}" ${d.autoboot?'checked':''} onchange="configs[${i}].autoboot=this.checked;dirty=true"><label for="ab${i}" style="color:#e0e0e0">Autoboot</label></div>
       </div>
+      <div class="row">
+        <div style="flex:1"><label>Allowed IPs</label><input type="text" value="${esc(d.allowed_ips||'')}" onchange="configs[${i}].allowed_ips=this.value;dirty=true" placeholder="empty = all allowed" title="Comma-separated IPs allowed to connect to this TCP port"></div>
+      </div>
       <div class="actions"><button class="btn btn-danger" onclick="removeConfig(${i})">Remove</button></div>
     </div>`;
   });
@@ -348,7 +353,7 @@ function addFromDevice(vid,pid,name,serial,intfCount){
   // (interface 0 = CDC control, interface 1 = CDC data — we need data interface for bulk endpoints)
   let defIntf = 0;
   if(intfCount>1) defIntf=1;  // CDC data interface is usually 1
-  configs.push({name:name||('Device '+hex4(vid)+':'+hex4(pid)),vid,pid,serial:serial||'',port:next,baud_rate:115200,interface:defIntf,autoboot:false});
+  configs.push({name:name||('Device '+hex4(vid)+':'+hex4(pid)),vid,pid,serial:serial||'',port:next,baud_rate:115200,interface:defIntf,autoboot:false,allowed_ips:''});
   dirty=true;
   renderConfigs();renderDiscovered();
   toast('Device added! Set TCP port and baud rate, then Save & Reboot.');
@@ -392,7 +397,8 @@ function getPassword(){return document.getElementById('s_password').value||''}
 function saveConfig(){
   const body=JSON.stringify(configs.map(d=>({
     name:d.name,vid:d.vid,pid:d.pid,serial:d.serial||'',
-    port:d.port,baud_rate:d.baud_rate,interface:d.interface||0,autoboot:!!d.autoboot
+    port:d.port,baud_rate:d.baud_rate,interface:d.interface||0,autoboot:!!d.autoboot,
+    allowed_ips:d.allowed_ips||''
   })));
   const hdrs={'Content-Type':'application/json'};
   const pw=getPassword();if(pw)hdrs['X-Admin-Password']=pw;
@@ -409,24 +415,24 @@ function saveConfig(){
 function loadSettings(){
   fetch('/api/usb/settings').then(r=>r.json()).then(s=>{
     document.getElementById('s_password').value=s.password||'';
-    document.getElementById('s_allowed_ips').value=s.allowed_ips||'';
     document.getElementById('s_mqtt_host').value=s.mqtt_host||'';
     document.getElementById('s_mqtt_port').value=s.mqtt_port||1883;
     document.getElementById('s_mqtt_user').value=s.mqtt_user||'';
     document.getElementById('s_mqtt_pass').value=s.mqtt_pass||'';
     document.getElementById('s_mqtt_en').checked=!!s.mqtt_enabled;
+    document.getElementById('s_mqtt_disc').checked=!!s.mqtt_discovery;
   }).catch(()=>{});
 }
 
 function saveSettings(){
   const body=JSON.stringify({
     password:document.getElementById('s_password').value,
-    allowed_ips:document.getElementById('s_allowed_ips').value,
     mqtt_host:document.getElementById('s_mqtt_host').value,
     mqtt_port:parseInt(document.getElementById('s_mqtt_port').value)||1883,
     mqtt_user:document.getElementById('s_mqtt_user').value,
     mqtt_pass:document.getElementById('s_mqtt_pass').value,
-    mqtt_enabled:document.getElementById('s_mqtt_en').checked
+    mqtt_enabled:document.getElementById('s_mqtt_en').checked,
+    mqtt_discovery:document.getElementById('s_mqtt_disc').checked
   });
   const hdrs={'Content-Type':'application/json'};
   const pw=getPassword();if(pw)hdrs['X-Admin-Password']=pw;
@@ -496,12 +502,12 @@ static esp_err_t handle_get_settings_(httpd_req_t *req) {
   char buf[512]; char *p = buf; const char *end = buf + sizeof(buf) - 2;
   *p++ = '{';
   json_append_str(p, end, "password", s.admin_password);
-  json_append_str(p, end, "allowed_ips", s.allowed_ips);
   json_append_str(p, end, "mqtt_host", s.mqtt_host);
   json_append_int(p, end, "mqtt_port", s.mqtt_port);
   json_append_str(p, end, "mqtt_user", s.mqtt_user);
   json_append_str(p, end, "mqtt_pass", s.mqtt_password);
-  json_append_bool(p, end, "mqtt_enabled", s.mqtt_enabled, false);
+  json_append_bool(p, end, "mqtt_enabled", s.mqtt_enabled);
+  json_append_bool(p, end, "mqtt_discovery", s.mqtt_discovery, false);
   *p++ = '}'; *p = 0;
   httpd_resp_set_type(req, "application/json");
   httpd_resp_send(req, buf, p - buf);
@@ -529,12 +535,12 @@ static esp_err_t handle_post_settings_(httpd_req_t *req) {
   BridgeSettings s;
   memset(&s, 0, sizeof(s));
   json_get_str(body, "password", s.admin_password, sizeof(s.admin_password));
-  json_get_str(body, "allowed_ips", s.allowed_ips, sizeof(s.allowed_ips));
   json_get_str(body, "mqtt_host", s.mqtt_host, sizeof(s.mqtt_host));
   s.mqtt_port = json_get_int(body, "mqtt_port", 1883);
   json_get_str(body, "mqtt_user", s.mqtt_user, sizeof(s.mqtt_user));
   json_get_str(body, "mqtt_pass", s.mqtt_password, sizeof(s.mqtt_password));
   s.mqtt_enabled = json_get_bool(body, "mqtt_enabled", false) ? 1 : 0;
+  s.mqtt_discovery = json_get_bool(body, "mqtt_discovery", false) ? 1 : 0;
   free(body);
 
   nvs_save_settings(s);

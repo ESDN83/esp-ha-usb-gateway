@@ -225,12 +225,8 @@ class UsbBridgeComponent : public Component {
     load_nvs_config_();
     BRIDGE_LOG("Loaded %zu saved device configs from NVS", connections_.size());
 
-    // Load bridge settings (password, IP whitelist, MQTT)
+    // Load bridge settings (password, MQTT)
     nvs_load_settings(settings_);
-    if (settings_.allowed_ips[0])
-      BRIDGE_LOG("IP whitelist: %s", settings_.allowed_ips);
-    else
-      BRIDGE_LOG("IP whitelist: disabled (all IPs allowed)");
 
     // Generate unique MQTT ID from MAC
     uint8_t mac[6];
@@ -1014,7 +1010,8 @@ class UsbBridgeComponent : public Component {
     switch (id) {
       case MQTT_EVENT_CONNECTED:
         BRIDGE_LOG("MQTT connected");
-        self->mqtt_publish_discovery_();
+        if (self->settings_.mqtt_discovery)
+          self->mqtt_publish_discovery_();
         self->mqtt_publish_state_();
         // Publish online availability
         {
@@ -1198,8 +1195,8 @@ class UsbBridgeComponent : public Component {
         char as[INET_ADDRSTRLEN];
         inet_ntoa_r(ca.sin_addr, as, sizeof(as));
 
-        // IP whitelist check
-        if (!is_ip_allowed(as, settings_.allowed_ips)) {
+        // Per-device IP whitelist check
+        if (!is_ip_allowed(as, conn->config.allowed_ips)) {
           BRIDGE_LOGW("TCP connection REJECTED from %s on port %d (not in whitelist)",
                      as, conn->config.port);
           lwip_close(cfd);
@@ -1254,7 +1251,8 @@ static esp_err_t handle_get_config_(httpd_req_t *req) {
     json_append_int(p, end, "baud_rate", cfg.baud_rate);
     json_append_int(p, end, "interface", cfg.interface);
     json_append_bool(p, end, "autoboot", cfg.autoboot);
-    json_append_str(p, end, "serial", cfg.serial, false);
+    json_append_str(p, end, "serial", cfg.serial);
+    json_append_str(p, end, "allowed_ips", cfg.allowed_ips, false);
     *p++ = '}';
   }
   *p++ = ']'; *p = 0;
@@ -1352,6 +1350,7 @@ static esp_err_t handle_post_config_(httpd_req_t *req) {
     StoredDeviceConfig cfg = {};
     json_get_str(obj, "name", cfg.name, sizeof(cfg.name));
     json_get_str(obj, "serial", cfg.serial, sizeof(cfg.serial));
+    json_get_str(obj, "allowed_ips", cfg.allowed_ips, sizeof(cfg.allowed_ips));
     cfg.vid = json_get_int(obj, "vid", 0);
     cfg.pid = json_get_int(obj, "pid", 0);
     cfg.port = json_get_int(obj, "port", 8880);
