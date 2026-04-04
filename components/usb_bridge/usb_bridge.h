@@ -1062,6 +1062,7 @@ class UsbBridgeComponent : public Component {
     cfg.session.last_will.msg_len = 7;
     cfg.session.last_will.qos = 1;
     cfg.session.last_will.retain = 1;
+    cfg.session.keepalive = 30;  // MQTT PINGREQ every 30s
 
     mqtt_client_ = esp_mqtt_client_init(&cfg);
     if (!mqtt_client_) { BRIDGE_LOGE("MQTT client init failed"); return; }
@@ -1211,6 +1212,13 @@ class UsbBridgeComponent : public Component {
         opt = 1;
         lwip_setsockopt(cfd, SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof(opt));
         lwip_setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+        // Aggressive keepalive: detect dead connections in ~60s
+        int keepidle = 30;   // first probe after 30s idle
+        int keepintvl = 10;  // probe every 10s
+        int keepcnt = 3;     // drop after 3 failed probes
+        lwip_setsockopt(cfd, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
+        lwip_setsockopt(cfd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
+        lwip_setsockopt(cfd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
         conn->tcp_client_fd.store(cfd);
 
         uint8_t buf[256];
