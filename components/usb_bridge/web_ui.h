@@ -257,7 +257,7 @@ input:focus{border-color:#4fc3f7;outline:none}
 <h2>Settings</h2>
 <div class="card" id="settings-panel">
 <div class="row">
-<div><label>Admin Password</label><div style="display:flex;gap:4px"><input type="password" id="s_password" placeholder="(none = open)" style="flex:1"><button class="btn btn-secondary" type="button" onclick="const p=document.getElementById('s_password');p.type=p.type==='password'?'text':'password';this.textContent=p.type==='password'?'Show':'Hide'" style="padding:4px 10px;font-size:.8em">Show</button></div></div>
+<div><label>Admin Password</label><div style="display:flex;gap:4px"><input type="password" id="s_password" placeholder="(none = open)" style="flex:1"><button class="btn btn-secondary" type="button" onclick="const p=document.getElementById('s_password');p.type=p.type==='password'?'text':'password';this.textContent=p.type==='password'?'Show':'Hide'" style="padding:4px 10px;font-size:.8em">Show</button><button class="btn btn-danger" type="button" id="s_pw_clear" style="padding:4px 10px;font-size:.8em;display:none" onclick="clearAdminPassword()">Clear</button></div></div>
 </div>
 <div class="row">
 <div><label>MQTT Host</label><input type="text" id="s_mqtt_host" placeholder="192.168.1.x"></div>
@@ -430,6 +430,7 @@ function loadSettings(){
     document.getElementById('s_mqtt_en').checked=!!s.mqtt_enabled;
     document.getElementById('s_mqtt_disc').checked=!!s.mqtt_discovery;
     window._hasAdminPw=!!s.has_password;
+    document.getElementById('s_pw_clear').style.display=s.has_password?'inline-block':'none';
   }).catch(()=>{});
 }
 
@@ -449,6 +450,16 @@ function saveSettings(){
     .then(r=>{if(r.status===401)throw new Error('Wrong password');if(!r.ok)throw new Error(r.status);return r.json()})
     .then(d=>toast(d.message||'Settings saved!'))
     .catch(e=>toast('Settings save failed: '+e,true));
+}
+
+function clearAdminPassword(){
+  if(!confirm('Remove admin password? Settings will be unprotected.')) return;
+  const hdrs={'Content-Type':'application/json'};
+  const pw=getPassword();if(pw)hdrs['X-Admin-Password']=pw;
+  fetch('/api/usb/settings/clear-password',{method:'POST',headers:hdrs})
+    .then(r=>{if(r.status===401)throw new Error('Wrong password');if(!r.ok)throw new Error(r.status);return r.json()})
+    .then(d=>{toast(d.message||'Password cleared');loadSettings();})
+    .catch(e=>toast('Failed: '+e,true));
 }
 
 function loadLog(){
@@ -561,6 +572,17 @@ static esp_err_t handle_post_settings_(httpd_req_t *req) {
   return ESP_OK;
 }
 
+static esp_err_t handle_clear_password_(httpd_req_t *req) {
+  BridgeSettings cur;
+  nvs_load_settings(cur);
+  if (!check_admin_auth_(req, cur.admin_password)) return ESP_OK;
+  cur.admin_password[0] = '\0';
+  nvs_save_settings(cur);
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_sendstr(req, "{\"message\":\"Admin password removed.\",\"ok\":true}");
+  return ESP_OK;
+}
+
 static httpd_handle_t start_config_webserver_(int port) {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = port;
@@ -581,6 +603,7 @@ static httpd_handle_t start_config_webserver_(int port) {
   httpd_uri_t get_log = {.uri = "/api/usb/log", .method = HTTP_GET, .handler = handle_get_log_, .user_ctx = nullptr};
   httpd_uri_t get_set = {.uri = "/api/usb/settings", .method = HTTP_GET, .handler = handle_get_settings_, .user_ctx = nullptr};
   httpd_uri_t post_set = {.uri = "/api/usb/settings", .method = HTTP_POST, .handler = handle_post_settings_, .user_ctx = nullptr};
+  httpd_uri_t clr_pw = {.uri = "/api/usb/settings/clear-password", .method = HTTP_POST, .handler = handle_clear_password_, .user_ctx = nullptr};
 
   httpd_register_uri_handler(server, &root);
   httpd_register_uri_handler(server, &get_cfg);
@@ -589,6 +612,7 @@ static httpd_handle_t start_config_webserver_(int port) {
   httpd_register_uri_handler(server, &get_log);
   httpd_register_uri_handler(server, &get_set);
   httpd_register_uri_handler(server, &post_set);
+  httpd_register_uri_handler(server, &clr_pw);
 
   ESP_LOGI(WEB_TAG, "Config UI at http://<ip>:%d/", port);
   return server;
