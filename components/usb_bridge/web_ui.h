@@ -392,7 +392,13 @@ function refreshStatus(){
   }).catch(e=>toast('Refresh failed: '+e,true));
 }
 
-function getPassword(){return document.getElementById('s_password').value||''}
+function getPassword(){
+  const pw=document.getElementById('s_password').value;
+  if(pw) return pw;
+  if(!window._hasAdminPw) return '';
+  const entered=prompt('Admin password required:');
+  return entered||'';
+}
 
 function saveConfig(){
   const body=JSON.stringify(configs.map(d=>({
@@ -414,13 +420,16 @@ function saveConfig(){
 
 function loadSettings(){
   fetch('/api/usb/settings').then(r=>r.json()).then(s=>{
-    document.getElementById('s_password').value=s.password||'';
+    document.getElementById('s_password').value='';
+    document.getElementById('s_password').placeholder=s.has_password?'(password set — enter to change)':'(none = open)';
     document.getElementById('s_mqtt_host').value=s.mqtt_host||'';
     document.getElementById('s_mqtt_port').value=s.mqtt_port||1883;
     document.getElementById('s_mqtt_user').value=s.mqtt_user||'';
-    document.getElementById('s_mqtt_pass').value=s.mqtt_pass||'';
+    document.getElementById('s_mqtt_pass').value='';
+    document.getElementById('s_mqtt_pass').placeholder=s.has_mqtt_pass?'(set — enter to change)':'(optional)';
     document.getElementById('s_mqtt_en').checked=!!s.mqtt_enabled;
     document.getElementById('s_mqtt_disc').checked=!!s.mqtt_discovery;
+    window._hasAdminPw=!!s.has_password;
   }).catch(()=>{});
 }
 
@@ -501,11 +510,11 @@ static esp_err_t handle_get_settings_(httpd_req_t *req) {
   nvs_load_settings(s);
   char buf[512]; char *p = buf; const char *end = buf + sizeof(buf) - 2;
   *p++ = '{';
-  json_append_str(p, end, "password", s.admin_password);
+  json_append_bool(p, end, "has_password", s.admin_password[0] != '\0');
   json_append_str(p, end, "mqtt_host", s.mqtt_host);
   json_append_int(p, end, "mqtt_port", s.mqtt_port);
   json_append_str(p, end, "mqtt_user", s.mqtt_user);
-  json_append_str(p, end, "mqtt_pass", s.mqtt_password);
+  json_append_bool(p, end, "has_mqtt_pass", s.mqtt_password[0] != '\0');
   json_append_bool(p, end, "mqtt_enabled", s.mqtt_enabled);
   json_append_bool(p, end, "mqtt_discovery", s.mqtt_discovery, false);
   *p++ = '}'; *p = 0;
@@ -532,13 +541,16 @@ static esp_err_t handle_post_settings_(httpd_req_t *req) {
   }
   body[total_len] = 0;
 
-  BridgeSettings s;
-  memset(&s, 0, sizeof(s));
-  json_get_str(body, "password", s.admin_password, sizeof(s.admin_password));
+  BridgeSettings s = cur;  // start from current settings
+  char new_pw[32] = {};
+  char new_mqtt_pw[64] = {};
+  json_get_str(body, "password", new_pw, sizeof(new_pw));
+  if (new_pw[0]) strncpy(s.admin_password, new_pw, sizeof(s.admin_password) - 1);
   json_get_str(body, "mqtt_host", s.mqtt_host, sizeof(s.mqtt_host));
   s.mqtt_port = json_get_int(body, "mqtt_port", 1883);
   json_get_str(body, "mqtt_user", s.mqtt_user, sizeof(s.mqtt_user));
-  json_get_str(body, "mqtt_pass", s.mqtt_password, sizeof(s.mqtt_password));
+  json_get_str(body, "mqtt_pass", new_mqtt_pw, sizeof(new_mqtt_pw));
+  if (new_mqtt_pw[0]) strncpy(s.mqtt_password, new_mqtt_pw, sizeof(s.mqtt_password) - 1);
   s.mqtt_enabled = json_get_bool(body, "mqtt_enabled", false) ? 1 : 0;
   s.mqtt_discovery = json_get_bool(body, "mqtt_discovery", false) ? 1 : 0;
   free(body);
