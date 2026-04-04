@@ -257,7 +257,7 @@ input:focus{border-color:#4fc3f7;outline:none}
 <h2>Settings</h2>
 <div class="card" id="settings-panel">
 <div class="row">
-<div><label>Admin Password</label><input type="password" id="s_password" placeholder="(none = open)"></div>
+<div><label>Admin Password</label><div style="display:flex;gap:4px"><input type="password" id="s_password" placeholder="(none = open)" style="flex:1"><button class="btn btn-secondary" type="button" onclick="const p=document.getElementById('s_password');p.type=p.type==='password'?'text':'password';this.textContent=p.type==='password'?'Show':'Hide'" style="padding:4px 10px;font-size:.8em">Show</button></div></div>
 </div>
 <div class="row">
 <div><label>MQTT Host</label><input type="text" id="s_mqtt_host" placeholder="192.168.1.x"></div>
@@ -265,7 +265,7 @@ input:focus{border-color:#4fc3f7;outline:none}
 </div>
 <div class="row">
 <div><label>MQTT User</label><input type="text" id="s_mqtt_user" placeholder="(optional)"></div>
-<div><label>MQTT Password</label><input type="password" id="s_mqtt_pass" placeholder="(optional)"></div>
+<div><label>MQTT Password</label><div style="display:flex;gap:4px"><input type="password" id="s_mqtt_pass" placeholder="(optional)" style="flex:1"><button class="btn btn-secondary" type="button" onclick="const p=document.getElementById('s_mqtt_pass');p.type=p.type==='password'?'text':'password';this.textContent=p.type==='password'?'Show':'Hide'" style="padding:4px 10px;font-size:.8em">Show</button></div></div>
 <div class="chk"><input type="checkbox" id="s_mqtt_en"><label for="s_mqtt_en" style="color:#e0e0e0">MQTT enabled</label></div>
 <div class="chk"><input type="checkbox" id="s_mqtt_disc"><label for="s_mqtt_disc" style="color:#e0e0e0">HA Auto Discovery</label></div>
 </div>
