@@ -138,17 +138,54 @@ static bool is_ip_allowed(const char *ip, const char *allowed_list) {
   return false;
 }
 
+// Base64 decode (minimal, for Basic Auth)
+static int base64_decode_(const char *in, char *out, size_t max_out) {
+  static const int8_t T[128] = {
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
+    52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
+    -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
+    15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
+    -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+    41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1};
+  size_t len = strlen(in), o = 0;
+  for (size_t i = 0; i < len && o < max_out - 1; i += 4) {
+    uint32_t n = 0; int pad = 0;
+    for (int j = 0; j < 4 && i + j < len; j++) {
+      uint8_t c = (uint8_t)in[i + j];
+      if (c == '=') { pad++; n <<= 6; }
+      else if (c < 128 && T[c] >= 0) { n = (n << 6) | T[c]; }
+      else { n <<= 6; }
+    }
+    if (o < max_out - 1) out[o++] = (n >> 16) & 0xFF;
+    if (pad < 2 && o < max_out - 1) out[o++] = (n >> 8) & 0xFF;
+    if (pad < 1 && o < max_out - 1) out[o++] = n & 0xFF;
+  }
+  out[o] = 0;
+  return o;
+}
+
 static bool check_admin_auth_(httpd_req_t *req, const char *required_password) {
   if (!required_password || required_password[0] == '\0') return true;
-  char pw_header[64] = {};
-  if (httpd_req_get_hdr_value_str(req, "X-Admin-Password", pw_header, sizeof(pw_header)) != ESP_OK ||
-      strcmp(pw_header, required_password) != 0) {
-    httpd_resp_set_status(req, "401 Unauthorized");
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, "{\"error\":\"Invalid password\"}");
-    return false;
+
+  // Check HTTP Basic Auth: "Authorization: Basic base64(admin:password)"
+  char auth_header[128] = {};
+  if (httpd_req_get_hdr_value_str(req, "Authorization", auth_header, sizeof(auth_header)) == ESP_OK) {
+    if (strncmp(auth_header, "Basic ", 6) == 0) {
+      char decoded[96] = {};
+      base64_decode_(auth_header + 6, decoded, sizeof(decoded));
+      // Format: "admin:password" — skip "admin:" prefix
+      char *colon = strchr(decoded, ':');
+      if (colon && strcmp(colon + 1, required_password) == 0) return true;
+    }
   }
-  return true;
+
+  httpd_resp_set_status(req, "401 Unauthorized");
+  httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"USB Gateway\"");
+  httpd_resp_set_type(req, "text/plain");
+  httpd_resp_sendstr(req, "Authentication required");
+  return false;
 }
 
 // ── Minimal JSON helpers ────────────────────────────────────
@@ -399,6 +436,12 @@ function getPassword(){
   const entered=prompt('Admin password required:');
   return entered||'';
 }
+function authHeaders(extra){
+  const h=Object.assign({},extra||{});
+  const pw=getPassword();
+  if(pw) h['Authorization']='Basic '+btoa('admin:'+pw);
+  return h;
+}
 
 function saveConfig(){
   const body=JSON.stringify(configs.map(d=>({
@@ -406,9 +449,7 @@ function saveConfig(){
     port:d.port,baud_rate:d.baud_rate,interface:d.interface||0,autoboot:!!d.autoboot,
     allowed_ips:d.allowed_ips||''
   })));
-  const hdrs={'Content-Type':'application/json'};
-  const pw=getPassword();if(pw)hdrs['X-Admin-Password']=pw;
-  fetch('/api/usb/config',{method:'POST',headers:hdrs,body})
+  fetch('/api/usb/config',{method:'POST',headers:authHeaders({'Content-Type':'application/json'}),body})
     .then(r=>{if(r.status===401)throw new Error('Wrong password');if(!r.ok)throw new Error(r.status);return r.json()})
     .then(d=>{
       dirty=false;
@@ -444,9 +485,7 @@ function saveSettings(){
     mqtt_enabled:document.getElementById('s_mqtt_en').checked,
     mqtt_discovery:document.getElementById('s_mqtt_disc').checked
   });
-  const hdrs={'Content-Type':'application/json'};
-  const pw=getPassword();if(pw)hdrs['X-Admin-Password']=pw;
-  fetch('/api/usb/settings',{method:'POST',headers:hdrs,body})
+  fetch('/api/usb/settings',{method:'POST',headers:authHeaders({'Content-Type':'application/json'}),body})
     .then(r=>{if(r.status===401)throw new Error('Wrong password');if(!r.ok)throw new Error(r.status);return r.json()})
     .then(d=>toast(d.message||'Settings saved!'))
     .catch(e=>toast('Settings save failed: '+e,true));
@@ -454,9 +493,7 @@ function saveSettings(){
 
 function clearAdminPassword(){
   if(!confirm('Remove admin password? Settings will be unprotected.')) return;
-  const hdrs={'Content-Type':'application/json'};
-  const pw=getPassword();if(pw)hdrs['X-Admin-Password']=pw;
-  fetch('/api/usb/settings/clear-password',{method:'POST',headers:hdrs})
+  fetch('/api/usb/settings/clear-password',{method:'POST',headers:authHeaders()})
     .then(r=>{if(r.status===401)throw new Error('Wrong password');if(!r.ok)throw new Error(r.status);return r.json()})
     .then(d=>{toast(d.message||'Password cleared');loadSettings();})
     .catch(e=>toast('Failed: '+e,true));
@@ -504,6 +541,9 @@ struct WebContext {
 static WebContext web_ctx_;
 
 static esp_err_t handle_root_(httpd_req_t *req) {
+  BridgeSettings s;
+  nvs_load_settings(s);
+  if (!check_admin_auth_(req, s.admin_password)) return ESP_OK;
   httpd_resp_set_type(req, "text/html");
   httpd_resp_send(req, HTML_PAGE, sizeof(HTML_PAGE) - 1);
   return ESP_OK;

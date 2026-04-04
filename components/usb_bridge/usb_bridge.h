@@ -1244,6 +1244,7 @@ UsbBridgeComponent *UsbBridgeComponent::instance_ = nullptr;
 static esp_err_t handle_get_config_(httpd_req_t *req) {
   auto *comp = web_ctx_.component;
   if (!comp) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No component"); return ESP_FAIL; }
+  if (!check_admin_auth_(req, comp->get_settings().admin_password)) return ESP_OK;
 
   auto &conns = comp->get_connections();
   char buf[2048];
@@ -1274,6 +1275,7 @@ static esp_err_t handle_get_config_(httpd_req_t *req) {
 static esp_err_t handle_get_status_(httpd_req_t *req) {
   auto *comp = web_ctx_.component;
   if (!comp) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No component"); return ESP_FAIL; }
+  if (!check_admin_auth_(req, comp->get_settings().admin_password)) return ESP_OK;
 
   auto &conns = comp->get_connections();
   auto &disc = comp->get_discovered();
@@ -1313,6 +1315,8 @@ static esp_err_t handle_get_status_(httpd_req_t *req) {
 }
 
 static esp_err_t handle_get_log_(httpd_req_t *req) {
+  BridgeSettings s; nvs_load_settings(s);
+  if (!check_admin_auth_(req, s.admin_password)) return ESP_OK;
   char *buf = (char *)malloc(LOG_RING_SIZE + 1);
   if (!buf) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM"); return ESP_FAIL; }
   size_t len = log_ring_read_(buf, LOG_RING_SIZE);
