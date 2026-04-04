@@ -182,7 +182,7 @@ static bool check_admin_auth_(httpd_req_t *req, const char *required_password) {
   }
 
   httpd_resp_set_status(req, "401 Unauthorized");
-  httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"USB Gateway\"");
+  httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"USB Gateway (user: admin)\"");
   httpd_resp_set_type(req, "text/plain");
   httpd_resp_sendstr(req, "Authentication required");
   return false;
