@@ -231,7 +231,7 @@ static void json_get_str(const char *json, const char *key, char *out, size_t ma
 static const char HTML_PAGE[] = R"rawliteral(<!DOCTYPE html>
 <html><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>USB Gateway</title>
+<title id="page-title-tag">USB Gateway</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,sans-serif;background:#1a1a2e;color:#e0e0e0;padding:16px;max-width:900px;margin:0 auto}
@@ -271,7 +271,7 @@ input:focus{border-color:#4fc3f7;outline:none}
 .chip-badge{font-size:.7em;padding:1px 6px;border-radius:8px;background:#2a3a5e;color:#90caf9;margin-left:6px}
 </style>
 </head><body>
-<h1>USB TCP Gateway</h1>
+<h1 id="page-title">USB TCP Gateway</h1>
 <p class="sub">Auto-detect USB devices, assign to TCP ports, save config</p>
 
 <h2>Detected USB Devices</h2>
@@ -412,6 +412,10 @@ function loadAll(){
       });
     }
     discovered=st.discovered||[];
+    if(st.friendly_name){
+      document.getElementById('page-title').textContent=st.friendly_name;
+      document.getElementById('page-title-tag').textContent=st.friendly_name;
+    }
     renderDiscovered();renderConfigs();
   }).catch(e=>toast('Load failed: '+e,true));
 }
