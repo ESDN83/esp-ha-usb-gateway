@@ -25,24 +25,23 @@ USB Devices ←→ USB Hub ←→ ESP32-S3 (USB Host OTG) ←→ TCP Sockets ←
 
 **Tested Integrations:** ZHA, Zigbee2MQTT (2.9.1), EnOcean MQTT UI
 
+## Features
+
+- **Web UI** — auto-detect USB devices, assign TCP ports, configure settings
+- **Password protection** — HTTP Basic Auth for web UI (TCP serial ports remain open)
+- **IP whitelist** — per-device restriction of which hosts can connect to serial ports
+- **MQTT with HA Auto Discovery** — bridge status, device count, uptime, firmware, restart button
+- **Multiple bridges** — each bridge uses its ESPHome `friendly_name` for unique identification
+
 ## Hardware Requirements
 
-- **ESP32-S3** dev board with two USB-C ports (e.g. ESP32-S3-DevKitC-1)
+- **ESP32-S3** dev board (e.g. ESP32-S3-DevKitC-1 or Waveshare ESP32-S3 ETH)
 - **Powered USB hub** (ESP32-S3 OTG port provides no VBUS) or USB-C OTG splitter with PD
 - USB serial device(s)
 
 ## Quick Start
 
-1. Add to your ESPHome config as external component:
-   ```yaml
-   external_components:
-     - source:
-         type: git
-         url: https://github.com/ESDN83/esp-ha-usb-gateway
-         ref: master
-       components: [usb_bridge]
-       refresh: 0s
-   ```
+1. Add to your ESPHome config as external component (see [Example Configs](#example-configs) below)
 
 2. Flash via ESPHome Dashboard, then open `http://<ESP_IP>/`
 
@@ -50,13 +49,110 @@ USB Devices ←→ USB Hub ←→ ESP32-S3 (USB Host OTG) ←→ TCP Sockets ←
 
 4. Connect your integration to `tcp://<ESP_IP>:<port>` (e.g. Zigbee2MQTT `serial.port`)
 
+5. Optional: Set admin password, IP whitelist, and MQTT in the Settings section
+
+## Example Configs
+
+### WiFi (ESP32-S3-DevKitC-1)
+
+```yaml
+esphome:
+  name: usb-bridge-z2m
+  friendly_name: USB TCP Bridge Z2M
+  platformio_options:
+    board_build.flash_mode: dio
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  framework:
+    type: esp-idf
+    version: recommended
+
+external_components:
+  - source:
+      type: git
+      url: https://github.com/ESDN83/esp-ha-usb-gateway
+      ref: master
+    components: [usb_bridge]
+    refresh: 0s
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+logger:
+  hardware_uart: UART0  # CRITICAL: default USB_SERIAL_JTAG blocks USB OTG!
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+usb_bridge:
+```
+
+### Ethernet (Waveshare ESP32-S3 ETH with W5500)
+
+```yaml
+esphome:
+  name: usb-bridge-enocean-eth
+  friendly_name: USB TCP Bridge Enocean ETH
+  platformio_options:
+    board_build.flash_mode: dio
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  framework:
+    type: esp-idf
+    version: recommended
+
+external_components:
+  - source:
+      type: git
+      url: https://github.com/ESDN83/esp-ha-usb-gateway
+      ref: master
+    components: [usb_bridge]
+    refresh: 0s
+
+ethernet:
+  type: W5500
+  clk_pin: GPIO13
+  mosi_pin: GPIO11
+  miso_pin: GPIO12
+  cs_pin: GPIO14
+  interrupt_pin: GPIO10
+  reset_pin: GPIO9
+  manual_ip:
+    static_ip: 192.168.1.122
+    gateway: 192.168.1.1
+    subnet: 255.255.255.0
+    dns1: 192.168.1.90
+
+logger:
+  hardware_uart: UART0
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+usb_bridge:
+```
+
 ## Web UI
 
 Built-in config interface at `http://<ESP_IP>/`:
 - Auto-detected USB devices with manufacturer, product, serial number
 - One-click device-to-TCP-port assignment
+- Per-device IP whitelist (restrict which hosts can connect)
+- Settings: admin password, MQTT with HA Auto Discovery
 - Debug log viewer
-- Save & Reboot applies config
 
 ## Zigbee2MQTT Example
 
