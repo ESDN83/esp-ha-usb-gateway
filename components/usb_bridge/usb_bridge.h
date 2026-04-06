@@ -1,6 +1,7 @@
 #pragma once
 
 #include "esphome/core/component.h"
+#include "esphome/core/application.h"
 #include "esphome/core/log.h"
 
 #include "freertos/FreeRTOS.h"
@@ -14,7 +15,6 @@
 #include "esp_netif.h"
 #include "esp_system.h"
 #include "esp_ota_ops.h"
-#include "esp_mac.h"
 #include "mqtt_client.h"
 
 #include <atomic>
@@ -229,11 +229,6 @@ class UsbBridgeComponent : public Component {
     // Load bridge settings (password, MQTT)
     nvs_load_settings(settings_);
 
-    // Generate unique MQTT ID from MAC
-    uint8_t mac[6];
-    esp_read_mac(mac, ESP_MAC_WIFI_STA);
-    snprintf(mqtt_uid_, sizeof(mqtt_uid_), "%02x%02x%02x", mac[3], mac[4], mac[5]);
-
     // Install USB host — IDF handles PHY init and root port reset internally
     const usb_host_config_t host_config = {
         .skip_phy_setup = false,
@@ -404,7 +399,6 @@ class UsbBridgeComponent : public Component {
 
   BridgeSettings settings_{};
   esp_mqtt_client_handle_t mqtt_client_{nullptr};
-  char mqtt_uid_[16]{};
   uint32_t last_mqtt_publish_{0};
 
   SemaphoreHandle_t ctrl_xfer_done_{nullptr};
@@ -1010,30 +1004,28 @@ class UsbBridgeComponent : public Component {
     auto *self = static_cast<UsbBridgeComponent *>(arg);
     auto *event = static_cast<esp_mqtt_event_handle_t>(data);
     switch (id) {
-      case MQTT_EVENT_CONNECTED:
+      case MQTT_EVENT_CONNECTED: {
         BRIDGE_LOG("MQTT connected");
+        const char *dn = App.get_name().c_str();
         if (self->settings_.mqtt_discovery)
           self->mqtt_publish_discovery_();
         self->mqtt_publish_state_();
         // Publish online availability
-        {
-          char topic[64];
-          snprintf(topic, sizeof(topic), "usb_bridge_%s/available", self->mqtt_uid_);
-          esp_mqtt_client_publish(self->mqtt_client_, topic, "online", 0, 1, 1);
-        }
+        char avail_t[96];
+        snprintf(avail_t, sizeof(avail_t), "%s/available", dn);
+        esp_mqtt_client_publish(self->mqtt_client_, avail_t, "online", 0, 1, 1);
         // Subscribe to restart command
-        {
-          char topic[64];
-          snprintf(topic, sizeof(topic), "usb_bridge_%s/restart", self->mqtt_uid_);
-          esp_mqtt_client_subscribe(self->mqtt_client_, topic, 0);
-        }
+        char restart_t[96];
+        snprintf(restart_t, sizeof(restart_t), "%s/restart", dn);
+        esp_mqtt_client_subscribe(self->mqtt_client_, restart_t, 0);
         break;
+      }
       case MQTT_EVENT_DATA:
         // Handle restart command
-        if (event->topic_len > 0) {
-          char topic[64];
-          snprintf(topic, sizeof(topic), "usb_bridge_%s/restart", self->mqtt_uid_);
-          if (strncmp(event->topic, topic, event->topic_len) == 0) {
+        if (event->topic && event->topic_len > 0) {
+          char cmd_t[96];
+          snprintf(cmd_t, sizeof(cmd_t), "%s/restart", App.get_name().c_str());
+          if (strncmp(event->topic, cmd_t, event->topic_len) == 0) {
             BRIDGE_LOG("MQTT restart command received");
             self->clean_reboot_();
           }
@@ -1047,11 +1039,12 @@ class UsbBridgeComponent : public Component {
   }
 
   void mqtt_init_() {
+    const char *dev_name = App.get_name().c_str();
     char uri[96];
     snprintf(uri, sizeof(uri), "mqtt://%s:%d", settings_.mqtt_host, settings_.mqtt_port);
 
-    char lwt_topic[64];
-    snprintf(lwt_topic, sizeof(lwt_topic), "usb_bridge_%s/available", mqtt_uid_);
+    char lwt_topic[96];
+    snprintf(lwt_topic, sizeof(lwt_topic), "%s/available", dev_name);
 
     esp_mqtt_client_config_t cfg = {};
     cfg.broker.address.uri = uri;
@@ -1073,65 +1066,68 @@ class UsbBridgeComponent : public Component {
 
   void mqtt_publish_discovery_() {
     if (!mqtt_client_) return;
-    char topic[128], payload[512];
-    const char *uid = mqtt_uid_;
+    const char *dn = App.get_name().c_str();
+    const char *fn = App.get_friendly_name().c_str();
+    // Use friendly_name for display, fall back to name
+    const char *display = (fn && fn[0]) ? fn : dn;
+    char topic[128], payload[640];
 
-    // Binary sensor: bridge online
-    snprintf(topic, sizeof(topic), "homeassistant/binary_sensor/usb_bridge_%s/online/config", uid);
+    // Binary sensor: bridge online (includes full device definition)
+    snprintf(topic, sizeof(topic), "homeassistant/binary_sensor/%s/online/config", dn);
     snprintf(payload, sizeof(payload),
-      "{\"name\":\"Online\",\"uniq_id\":\"usb_bridge_%s_online\","
-      "\"stat_t\":\"usb_bridge_%s/available\",\"pl_on\":\"online\",\"pl_off\":\"offline\","
+      "{\"name\":\"Online\",\"uniq_id\":\"%s_online\","
+      "\"stat_t\":\"%s/available\",\"pl_on\":\"online\",\"pl_off\":\"offline\","
       "\"dev_cla\":\"connectivity\","
-      "\"dev\":{\"ids\":[\"usb_bridge_%s\"],\"name\":\"USB TCP Bridge\",\"mf\":\"ESP32-S3\",\"mdl\":\"USB Gateway\",\"sw\":\"%s\"}}",
-      uid, uid, uid, FW_BUILD_ID);
+      "\"dev\":{\"ids\":[\"%s\"],\"name\":\"%s\",\"mf\":\"ESP32-S3\",\"mdl\":\"USB Gateway\",\"sw\":\"%s\"}}",
+      dn, dn, dn, display, FW_BUILD_ID);
     esp_mqtt_client_publish(mqtt_client_, topic, payload, 0, 1, 1);
 
     // Sensor: connected device count
-    snprintf(topic, sizeof(topic), "homeassistant/sensor/usb_bridge_%s/devices/config", uid);
+    snprintf(topic, sizeof(topic), "homeassistant/sensor/%s/devices/config", dn);
     snprintf(payload, sizeof(payload),
-      "{\"name\":\"Devices Connected\",\"uniq_id\":\"usb_bridge_%s_devices\","
-      "\"stat_t\":\"usb_bridge_%s/state\",\"val_tpl\":\"{{value_json.devices_connected}}\","
+      "{\"name\":\"Devices Connected\",\"uniq_id\":\"%s_devices\","
+      "\"stat_t\":\"%s/state\",\"val_tpl\":\"{{value_json.devices_connected}}\","
       "\"ic\":\"mdi:usb\","
-      "\"dev\":{\"ids\":[\"usb_bridge_%s\"]}}",
-      uid, uid, uid);
+      "\"dev\":{\"ids\":[\"%s\"]}}",
+      dn, dn, dn);
     esp_mqtt_client_publish(mqtt_client_, topic, payload, 0, 1, 1);
 
     // Sensor: firmware
-    snprintf(topic, sizeof(topic), "homeassistant/sensor/usb_bridge_%s/firmware/config", uid);
+    snprintf(topic, sizeof(topic), "homeassistant/sensor/%s/firmware/config", dn);
     snprintf(payload, sizeof(payload),
-      "{\"name\":\"Firmware\",\"uniq_id\":\"usb_bridge_%s_fw\","
-      "\"stat_t\":\"usb_bridge_%s/state\",\"val_tpl\":\"{{value_json.firmware}}\","
+      "{\"name\":\"Firmware\",\"uniq_id\":\"%s_fw\","
+      "\"stat_t\":\"%s/state\",\"val_tpl\":\"{{value_json.firmware}}\","
       "\"ic\":\"mdi:chip\",\"ent_cat\":\"diagnostic\","
-      "\"dev\":{\"ids\":[\"usb_bridge_%s\"]}}",
-      uid, uid, uid);
+      "\"dev\":{\"ids\":[\"%s\"]}}",
+      dn, dn, dn);
     esp_mqtt_client_publish(mqtt_client_, topic, payload, 0, 1, 1);
 
     // Sensor: uptime
-    snprintf(topic, sizeof(topic), "homeassistant/sensor/usb_bridge_%s/uptime/config", uid);
+    snprintf(topic, sizeof(topic), "homeassistant/sensor/%s/uptime/config", dn);
     snprintf(payload, sizeof(payload),
-      "{\"name\":\"Uptime\",\"uniq_id\":\"usb_bridge_%s_uptime\","
-      "\"stat_t\":\"usb_bridge_%s/state\",\"val_tpl\":\"{{value_json.uptime}}\","
+      "{\"name\":\"Uptime\",\"uniq_id\":\"%s_uptime\","
+      "\"stat_t\":\"%s/state\",\"val_tpl\":\"{{value_json.uptime}}\","
       "\"unit_of_meas\":\"s\",\"ic\":\"mdi:timer-outline\",\"ent_cat\":\"diagnostic\","
-      "\"dev\":{\"ids\":[\"usb_bridge_%s\"]}}",
-      uid, uid, uid);
+      "\"dev\":{\"ids\":[\"%s\"]}}",
+      dn, dn, dn);
     esp_mqtt_client_publish(mqtt_client_, topic, payload, 0, 1, 1);
 
     // Button: restart
-    snprintf(topic, sizeof(topic), "homeassistant/button/usb_bridge_%s/restart/config", uid);
+    snprintf(topic, sizeof(topic), "homeassistant/button/%s/restart/config", dn);
     snprintf(payload, sizeof(payload),
-      "{\"name\":\"Restart\",\"uniq_id\":\"usb_bridge_%s_restart\","
-      "\"cmd_t\":\"usb_bridge_%s/restart\",\"ic\":\"mdi:restart\","
-      "\"dev\":{\"ids\":[\"usb_bridge_%s\"]}}",
-      uid, uid, uid);
+      "{\"name\":\"Restart\",\"uniq_id\":\"%s_restart\","
+      "\"cmd_t\":\"%s/restart\",\"ic\":\"mdi:restart\","
+      "\"dev\":{\"ids\":[\"%s\"]}}",
+      dn, dn, dn);
     esp_mqtt_client_publish(mqtt_client_, topic, payload, 0, 1, 1);
 
-    BRIDGE_LOG("MQTT HA discovery published (%s)", uid);
+    BRIDGE_LOG("MQTT HA discovery published (device: %s)", display);
   }
 
   void mqtt_publish_state_() {
     if (!mqtt_client_) return;
-    char topic[64], payload[512];
-    snprintf(topic, sizeof(topic), "usb_bridge_%s/state", mqtt_uid_);
+    char topic[96], payload[512];
+    snprintf(topic, sizeof(topic), "%s/state", App.get_name().c_str());
 
     int dev_connected = 0;
     for (auto *c : connections_) {
@@ -1284,7 +1280,10 @@ static esp_err_t handle_get_status_(httpd_req_t *req) {
   char *p = buf;
   const char *end = buf + sizeof(buf) - 2;
 
-  p += snprintf(p, end - p, "{\"configured\":[");
+  const char *fn = App.get_friendly_name().c_str();
+  const char *nm = App.get_name().c_str();
+  p += snprintf(p, end - p, "{\"friendly_name\":\"%s\",\"name\":\"%s\",\"configured\":[",
+                (fn && fn[0]) ? fn : nm, nm);
   for (size_t i = 0; i < conns.size() && p < end - 100; i++) {
     if (i > 0) *p++ = ',';
     p += snprintf(p, end - p, "{\"connected\":%s,\"port\":%d,\"chip\":\"%s\"}",
