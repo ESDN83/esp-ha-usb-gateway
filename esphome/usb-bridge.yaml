@@ -67,9 +67,12 @@ button:
     name: Restart
 
 # USB Serial <-> TCP Bridge
-# No YAML device config needed!
-# All device configuration is done via web UI at http://<device-ip>/
+# Device configuration is done via web UI at http://<device-ip>/
 # Detected USB devices are shown automatically; assign TCP ports in the UI.
-# Sensors (Devices Connected, Firmware, Device List, Config URL) are
-# automatically created and sent to HA via ESPHome native API.
 usb_bridge:
+  devices_connected:
+    name: "Devices Connected"
+  firmware:
+    name: "Firmware"
+  device_list:
+    name: "Device List"
