@@ -3,8 +3,12 @@
 #include "esphome/core/component.h"
 #include "esphome/core/application.h"
 #include "esphome/core/log.h"
+#ifdef USE_SENSOR
 #include "esphome/components/sensor/sensor.h"
+#endif
+#ifdef USE_TEXT_SENSOR
 #include "esphome/components/text_sensor/text_sensor.h"
+#endif
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -202,6 +206,15 @@ class UsbBridgeComponent : public Component {
   SemaphoreHandle_t get_discovery_mutex() { return discovery_mutex_; }
   const BridgeSettings& get_settings() { return settings_; }
 
+  // Sensor setters (called by codegen from __init__.py)
+#ifdef USE_SENSOR
+  void set_devices_sensor(sensor::Sensor *sensor) { devices_sensor_ = sensor; }
+#endif
+#ifdef USE_TEXT_SENSOR
+  void set_firmware_sensor(text_sensor::TextSensor *sensor) { firmware_sensor_ = sensor; }
+  void set_device_list_sensor(text_sensor::TextSensor *sensor) { device_list_sensor_ = sensor; }
+#endif
+
   float get_setup_priority() const override {
     return setup_priority::AFTER_WIFI;
   }
@@ -273,8 +286,11 @@ class UsbBridgeComponent : public Component {
     BRIDGE_LOG("USB TCP Gateway ready — config UI at http://<ip>/");
     BRIDGE_LOG("NOTE: ESP32-S3 has 8 HCD channels. With hub, max 2 serial devices can be active.");
 
-    // Create native ESPHome sensors (auto-discovered by HA via API)
-    setup_sensors_();
+    // Publish initial sensor values (sensors created by codegen)
+#ifdef USE_TEXT_SENSOR
+    if (firmware_sensor_) firmware_sensor_->publish_state(FW_BUILD_ID);
+#endif
+    publish_sensors_();
   }
 
   void loop() override {
@@ -398,12 +414,14 @@ class UsbBridgeComponent : public Component {
 
   BridgeSettings settings_{};
 
-  // Native ESPHome sensors (replace MQTT)
+  // Native ESPHome sensors (set by codegen, replace MQTT)
+#ifdef USE_SENSOR
   sensor::Sensor *devices_sensor_{nullptr};
+#endif
+#ifdef USE_TEXT_SENSOR
   text_sensor::TextSensor *firmware_sensor_{nullptr};
   text_sensor::TextSensor *device_list_sensor_{nullptr};
-  text_sensor::TextSensor *config_url_sensor_{nullptr};
-  bool config_url_published_{false};
+#endif
   uint32_t last_sensor_publish_{0};
 
   SemaphoreHandle_t ctrl_xfer_done_{nullptr};
@@ -1006,83 +1024,17 @@ class UsbBridgeComponent : public Component {
   // ── TCP server per device ─────────────────────────────────
 
   // ── Native ESPHome sensors (replace MQTT) ─────────────────
-  void setup_sensors_() {
-    // Devices Connected sensor
-    devices_sensor_ = new sensor::Sensor();
-    devices_sensor_->set_name("Devices Connected");
-    devices_sensor_->set_object_id(std::string(App.get_name()) + "_devices_connected");
-    devices_sensor_->set_icon("mdi:usb");
-    devices_sensor_->set_accuracy_decimals(0);
-    devices_sensor_->set_state_class(sensor::STATE_CLASS_MEASUREMENT);
-    App.register_sensor(devices_sensor_);
-
-    // Firmware text sensor
-    firmware_sensor_ = new text_sensor::TextSensor();
-    firmware_sensor_->set_name("Firmware");
-    firmware_sensor_->set_object_id(std::string(App.get_name()) + "_firmware");
-    firmware_sensor_->set_icon("mdi:chip");
-    firmware_sensor_->set_entity_category(ENTITY_CATEGORY_DIAGNOSTIC);
-    App.register_text_sensor(firmware_sensor_);
-
-    // Device list text sensor (JSON)
-    device_list_sensor_ = new text_sensor::TextSensor();
-    device_list_sensor_->set_name("Device List");
-    device_list_sensor_->set_object_id(std::string(App.get_name()) + "_device_list");
-    device_list_sensor_->set_icon("mdi:format-list-bulleted");
-    device_list_sensor_->set_entity_category(ENTITY_CATEGORY_DIAGNOSTIC);
-    App.register_text_sensor(device_list_sensor_);
-
-    // Config URL text sensor (link to web UI)
-    auto *config_url = new text_sensor::TextSensor();
-    config_url->set_name("Config URL");
-    config_url->set_object_id(std::string(App.get_name()) + "_config_url");
-    config_url->set_icon("mdi:web");
-    config_url->set_entity_category(ENTITY_CATEGORY_DIAGNOSTIC);
-    App.register_text_sensor(config_url);
-
-    // Publish config URL once (doesn't change)
-    config_url_sensor_ = config_url;
-    publish_config_url_();
-
-    // Publish firmware once
-    firmware_sensor_->publish_state(FW_BUILD_ID);
-
-    // Initial sensor publish
-    publish_sensors_();
-    BRIDGE_LOG("ESPHome native sensors registered");
-  }
-
-  void publish_config_url_() {
-    if (config_url_published_) return;
-    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-    if (!netif) return;
-    esp_netif_ip_info_t ip_info;
-    if (esp_netif_get_ip_info(netif, &ip_info) == ESP_OK && ip_info.ip.addr != 0) {
-      char url[64];
-      snprintf(url, sizeof(url), "http://" IPSTR "/", IP2STR(&ip_info.ip));
-      if (config_url_sensor_) config_url_sensor_->publish_state(url);
-      // Set web_server_url so HA device page shows "Visit" / "Konfiguration" link
-#ifdef USE_WEB_SERVER
-      App.set_web_server_url(url);
-#endif
-      config_url_published_ = true;
-      BRIDGE_LOG("Config URL: %s", url);
-    }
-  }
-
   void publish_sensors_() {
-    // Count connected devices
-    int dev_connected = 0;
-    for (auto *c : connections_) {
-      if (c->connected.load()) dev_connected++;
+#ifdef USE_SENSOR
+    if (devices_sensor_) {
+      int dev_connected = 0;
+      for (auto *c : connections_) {
+        if (c->connected.load()) dev_connected++;
+      }
+      devices_sensor_->publish_state(dev_connected);
     }
-    if (devices_sensor_) devices_sensor_->publish_state(dev_connected);
-
-    // Publish config URL if not yet published (IP might not be ready at setup)
-    if (!config_url_published_)
-      publish_config_url_();
-
-    // Build device list JSON
+#endif
+#ifdef USE_TEXT_SENSOR
     if (device_list_sensor_) {
       char payload[512];
       char *p = payload;
@@ -1097,6 +1049,7 @@ class UsbBridgeComponent : public Component {
       *p++ = ']'; *p = 0;
       device_list_sensor_->publish_state(payload);
     }
+#endif
   }
 
   static void tcp_task_entry_(void *arg) {
