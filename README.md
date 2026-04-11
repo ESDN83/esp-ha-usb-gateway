@@ -14,8 +14,9 @@ USB Devices ←→ USB Hub ←→ ESP32-S3 (USB Host OTG) ←→ TCP Sockets ←
 - Supports FTDI, CP210X (Silicon Labs), CDC-ACM chips
 - Config stored in NVS flash — survives reboots
 
-<img width="1335" height="1759" alt="grafik" src="https://github.com/user-attachments/assets/1f06120b-2aa2-4952-a0c2-d9c84afc5925" />
+<img width="1594" height="1635" alt="grafik" src="https://github.com/user-attachments/assets/b5bfc47b-279f-4925-9bf0-9386fc8666e8" />
 
+<img width="1546" height="1440" alt="grafik" src="https://github.com/user-attachments/assets/cd9c2eeb-ed87-4218-9cf7-914446acd3e5" />
 
 ## Supported Devices
 
