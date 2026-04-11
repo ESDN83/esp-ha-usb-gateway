@@ -95,7 +95,26 @@ ota:
   - platform: esphome
     password: !secret ota_password
 
+# Built-in ESPHome sensors
+sensor:
+  - platform: uptime
+    name: Uptime
+    entity_category: diagnostic
+
+button:
+  - platform: restart
+    name: Restart
+
+# USB Bridge mit Sensoren
 usb_bridge:
+  devices_connected:
+    name: "Devices Connected"
+  firmware:
+    name: "Firmware"
+  device_list:
+    name: "Device List"
+  config_url:
+    name: "Config URL"
 ```
 
 ### Ethernet (Waveshare ESP32-S3 ETH with W5500)
@@ -146,7 +165,26 @@ ota:
   - platform: esphome
     password: !secret ota_password
 
+# Built-in ESPHome sensors
+sensor:
+  - platform: uptime
+    name: Uptime
+    entity_category: diagnostic
+
+button:
+  - platform: restart
+    name: Restart
+
+# USB Bridge mit Sensoren
 usb_bridge:
+  devices_connected:
+    name: "Devices Connected"
+  firmware:
+    name: "Firmware"
+  device_list:
+    name: "Device List"
+  config_url:
+    name: "Config URL"
 ```
 
 ## Web UI
