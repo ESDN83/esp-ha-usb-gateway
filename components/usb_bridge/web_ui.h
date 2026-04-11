@@ -91,22 +91,15 @@ static bool nvs_save_devices(const std::vector<StoredDeviceConfig> &devs) {
   return true;
 }
 
-// ── Bridge Settings (password, IP whitelist, MQTT) ──────────
+// ── Bridge Settings (password only — MQTT removed, uses ESPHome native API) ──
 struct BridgeSettings {
   char admin_password[32];
-  char _reserved[256];     // was: global allowed_ips (now per-device)
-  char mqtt_host[64];
-  uint16_t mqtt_port;
-  char mqtt_user[32];
-  char mqtt_password[64];
-  uint8_t mqtt_enabled;
-  uint8_t mqtt_discovery;   // HA MQTT auto-discovery
-  uint8_t _pad[2];
+  char _reserved1[256];    // was: global allowed_ips (now per-device)
+  char _reserved2[166];    // was: MQTT settings (removed — using native ESPHome API)
 };
 
 static bool nvs_load_settings(BridgeSettings &s) {
   memset(&s, 0, sizeof(s));
-  s.mqtt_port = 1883;
   nvs_handle_t h;
   if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) return false;
   size_t len = sizeof(s);
@@ -296,16 +289,6 @@ input:focus{border-color:#4fc3f7;outline:none}
 <div class="row">
 <div><label>Admin Password</label><div style="display:flex;gap:4px"><input type="password" id="s_password" placeholder="(none = open)" style="flex:1"><button class="btn btn-secondary" type="button" onclick="const p=document.getElementById('s_password');p.type=p.type==='password'?'text':'password';this.textContent=p.type==='password'?'Show':'Hide'" style="padding:4px 10px;font-size:.8em">Show</button><button class="btn btn-danger" type="button" id="s_pw_clear" style="padding:4px 10px;font-size:.8em;display:none" onclick="clearAdminPassword()">Clear</button></div></div>
 </div>
-<div class="row">
-<div><label>MQTT Host</label><input type="text" id="s_mqtt_host" placeholder="192.168.1.x"></div>
-<div><label>MQTT Port</label><input type="number" id="s_mqtt_port" value="1883" min="1" max="65535"></div>
-</div>
-<div class="row">
-<div><label>MQTT User</label><input type="text" id="s_mqtt_user" placeholder="(optional)"></div>
-<div><label>MQTT Password</label><div style="display:flex;gap:4px"><input type="password" id="s_mqtt_pass" placeholder="(optional)" style="flex:1"><button class="btn btn-secondary" type="button" onclick="const p=document.getElementById('s_mqtt_pass');p.type=p.type==='password'?'text':'password';this.textContent=p.type==='password'?'Show':'Hide'" style="padding:4px 10px;font-size:.8em">Show</button></div></div>
-<div class="chk"><input type="checkbox" id="s_mqtt_en"><label for="s_mqtt_en" style="color:#e0e0e0">MQTT enabled</label></div>
-<div class="chk"><input type="checkbox" id="s_mqtt_disc"><label for="s_mqtt_disc" style="color:#e0e0e0">HA Auto Discovery</label></div>
-</div>
 <div class="toolbar">
 <button class="btn btn-primary" onclick="saveSettings()">Save Settings</button>
 </div>
@@ -467,13 +450,6 @@ function loadSettings(){
   fetch('/api/usb/settings').then(r=>r.json()).then(s=>{
     document.getElementById('s_password').value='';
     document.getElementById('s_password').placeholder=s.has_password?'(password set — enter to change)':'(none = open)';
-    document.getElementById('s_mqtt_host').value=s.mqtt_host||'';
-    document.getElementById('s_mqtt_port').value=s.mqtt_port||1883;
-    document.getElementById('s_mqtt_user').value=s.mqtt_user||'';
-    document.getElementById('s_mqtt_pass').value='';
-    document.getElementById('s_mqtt_pass').placeholder=s.has_mqtt_pass?'(set — enter to change)':'(optional)';
-    document.getElementById('s_mqtt_en').checked=!!s.mqtt_enabled;
-    document.getElementById('s_mqtt_disc').checked=!!s.mqtt_discovery;
     window._hasAdminPw=!!s.has_password;
     document.getElementById('s_pw_clear').style.display=s.has_password?'inline-block':'none';
   }).catch(()=>{});
@@ -481,13 +457,7 @@ function loadSettings(){
 
 function saveSettings(){
   const body=JSON.stringify({
-    password:document.getElementById('s_password').value,
-    mqtt_host:document.getElementById('s_mqtt_host').value,
-    mqtt_port:parseInt(document.getElementById('s_mqtt_port').value)||1883,
-    mqtt_user:document.getElementById('s_mqtt_user').value,
-    mqtt_pass:document.getElementById('s_mqtt_pass').value,
-    mqtt_enabled:document.getElementById('s_mqtt_en').checked,
-    mqtt_discovery:document.getElementById('s_mqtt_disc').checked
+    password:document.getElementById('s_password').value
   });
   fetch('/api/usb/settings',{method:'POST',headers:authHeaders({'Content-Type':'application/json'}),body})
     .then(r=>{if(r.status===401)throw new Error('Wrong password');if(!r.ok)throw new Error(r.status);return r.json()})
@@ -563,15 +533,9 @@ static esp_err_t handle_get_log_(httpd_req_t *req);
 static esp_err_t handle_get_settings_(httpd_req_t *req) {
   BridgeSettings s;
   nvs_load_settings(s);
-  char buf[512]; char *p = buf; const char *end = buf + sizeof(buf) - 2;
+  char buf[128]; char *p = buf; const char *end = buf + sizeof(buf) - 2;
   *p++ = '{';
-  json_append_bool(p, end, "has_password", s.admin_password[0] != '\0');
-  json_append_str(p, end, "mqtt_host", s.mqtt_host);
-  json_append_int(p, end, "mqtt_port", s.mqtt_port);
-  json_append_str(p, end, "mqtt_user", s.mqtt_user);
-  json_append_bool(p, end, "has_mqtt_pass", s.mqtt_password[0] != '\0');
-  json_append_bool(p, end, "mqtt_enabled", s.mqtt_enabled);
-  json_append_bool(p, end, "mqtt_discovery", s.mqtt_discovery, false);
+  json_append_bool(p, end, "has_password", s.admin_password[0] != '\0', false);
   *p++ = '}'; *p = 0;
   httpd_resp_set_type(req, "application/json");
   httpd_resp_send(req, buf, p - buf);
@@ -598,21 +562,13 @@ static esp_err_t handle_post_settings_(httpd_req_t *req) {
 
   BridgeSettings s = cur;  // start from current settings
   char new_pw[32] = {};
-  char new_mqtt_pw[64] = {};
   json_get_str(body, "password", new_pw, sizeof(new_pw));
   if (new_pw[0]) strncpy(s.admin_password, new_pw, sizeof(s.admin_password) - 1);
-  json_get_str(body, "mqtt_host", s.mqtt_host, sizeof(s.mqtt_host));
-  s.mqtt_port = json_get_int(body, "mqtt_port", 1883);
-  json_get_str(body, "mqtt_user", s.mqtt_user, sizeof(s.mqtt_user));
-  json_get_str(body, "mqtt_pass", new_mqtt_pw, sizeof(new_mqtt_pw));
-  if (new_mqtt_pw[0]) strncpy(s.mqtt_password, new_mqtt_pw, sizeof(s.mqtt_password) - 1);
-  s.mqtt_enabled = json_get_bool(body, "mqtt_enabled", false) ? 1 : 0;
-  s.mqtt_discovery = json_get_bool(body, "mqtt_discovery", false) ? 1 : 0;
   free(body);
 
   nvs_save_settings(s);
   httpd_resp_set_type(req, "application/json");
-  httpd_resp_sendstr(req, "{\"message\":\"Settings saved! Reboot to apply MQTT changes.\",\"ok\":true}");
+  httpd_resp_sendstr(req, "{\"message\":\"Settings saved!\",\"ok\":true}");
   return ESP_OK;
 }
 
