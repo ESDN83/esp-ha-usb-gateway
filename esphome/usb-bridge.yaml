@@ -56,8 +56,20 @@ ota:
 # web_server removed — USB config UI runs on port 80 directly
 # ESPHome API (port 6053) and OTA still work normally
 
+# Built-in ESPHome sensors (replaces MQTT — no broker/credentials needed)
+sensor:
+  - platform: uptime
+    name: Uptime
+    entity_category: diagnostic
+
+button:
+  - platform: restart
+    name: Restart
+
 # USB Serial <-> TCP Bridge
 # No YAML device config needed!
 # All device configuration is done via web UI at http://<device-ip>/
 # Detected USB devices are shown automatically; assign TCP ports in the UI.
+# Sensors (Devices Connected, Firmware, Device List, Config URL) are
+# automatically created and sent to HA via ESPHome native API.
 usb_bridge:

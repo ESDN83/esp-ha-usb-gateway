@@ -1,9 +1,10 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome.const import CONF_ID
-from esphome.components.esp32 import add_idf_sdkconfig_option, include_builtin_idf_component
+from esphome.components.esp32 import add_idf_sdkconfig_option
 
 DEPENDENCIES = ["network"]
+AUTO_LOAD = ["sensor", "text_sensor"]
 CODEOWNERS = []
 
 usb_bridge_ns = cg.esphome_ns.namespace("usb_bridge")
@@ -39,6 +40,6 @@ async def to_code(config):
     add_idf_sdkconfig_option("CONFIG_SPIRAM", False)
     add_idf_sdkconfig_option("CONFIG_ESP32S3_SPIRAM_SUPPORT", False)
 
-    # MQTT client for HA discovery — ESPHome excludes IDF mqtt component by default
-    include_builtin_idf_component("mqtt")
-    add_idf_sdkconfig_option("CONFIG_MQTT_PROTOCOL_311", True)
+    # Enable web_server_url in API device info (shows "Visit" link on HA device page)
+    # We don't use ESPHome's web_server component — just the URL field in the API response.
+    cg.add_define("USE_WEB_SERVER")

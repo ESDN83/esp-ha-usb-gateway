@@ -3,6 +3,8 @@
 #include "esphome/core/component.h"
 #include "esphome/core/application.h"
 #include "esphome/core/log.h"
+#include "esphome/components/sensor/sensor.h"
+#include "esphome/components/text_sensor/text_sensor.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -15,7 +17,6 @@
 #include "esp_netif.h"
 #include "esp_system.h"
 #include "esp_ota_ops.h"
-#include "mqtt_client.h"
 
 #include <atomic>
 #include <cstring>
@@ -27,7 +28,7 @@ namespace esphome {
 namespace usb_bridge {
 
 static const char *const TAG = "usb_bridge";
-static const char *const FW_BUILD_ID = "usb-bridge build 2026-04-03-a";
+static const char *const FW_BUILD_ID = "usb-bridge build 2026-04-11-a";
 
 // Known USB serial chip vendors
 static constexpr uint16_t FTDI_VID = 0x0403;
@@ -226,7 +227,7 @@ class UsbBridgeComponent : public Component {
     load_nvs_config_();
     BRIDGE_LOG("Loaded %zu saved device configs from NVS", connections_.size());
 
-    // Load bridge settings (password, MQTT)
+    // Load bridge settings (admin password)
     nvs_load_settings(settings_);
 
     // Install USB host — IDF handles PHY init and root port reset internally
@@ -272,10 +273,8 @@ class UsbBridgeComponent : public Component {
     BRIDGE_LOG("USB TCP Gateway ready — config UI at http://<ip>/");
     BRIDGE_LOG("NOTE: ESP32-S3 has 8 HCD channels. With hub, max 2 serial devices can be active.");
 
-    // Start MQTT if enabled
-    if (settings_.mqtt_enabled && settings_.mqtt_host[0]) {
-      mqtt_init_();
-    }
+    // Create native ESPHome sensors (auto-discovered by HA via API)
+    setup_sensors_();
   }
 
   void loop() override {
@@ -325,10 +324,10 @@ class UsbBridgeComponent : public Component {
       }
     }
 
-    // MQTT periodic state publish (every 30s)
-    if (mqtt_client_ && millis() - last_mqtt_publish_ > 30000) {
-      last_mqtt_publish_ = millis();
-      mqtt_publish_state_();
+    // Update ESPHome sensors (every 30s)
+    if (millis() - last_sensor_publish_ > 30000) {
+      last_sensor_publish_ = millis();
+      publish_sensors_();
     }
   }
 
@@ -365,7 +364,7 @@ class UsbBridgeComponent : public Component {
     return false;
   }
 
-  // Clean reboot with USB shutdown (used by MQTT restart and web UI reboot task)
+  // Clean reboot with USB shutdown (used by web UI reboot task)
   void clean_reboot_() {
     BRIDGE_LOG("Clean reboot — shutting down USB...");
     for (auto *conn : connections_) {
@@ -398,8 +397,14 @@ class UsbBridgeComponent : public Component {
   usb_host_client_handle_t client_hdl_{nullptr};
 
   BridgeSettings settings_{};
-  esp_mqtt_client_handle_t mqtt_client_{nullptr};
-  uint32_t last_mqtt_publish_{0};
+
+  // Native ESPHome sensors (replace MQTT)
+  sensor::Sensor *devices_sensor_{nullptr};
+  text_sensor::TextSensor *firmware_sensor_{nullptr};
+  text_sensor::TextSensor *device_list_sensor_{nullptr};
+  text_sensor::TextSensor *config_url_sensor_{nullptr};
+  bool config_url_published_{false};
+  uint32_t last_sensor_publish_{0};
 
   SemaphoreHandle_t ctrl_xfer_done_{nullptr};
   usb_transfer_status_t ctrl_xfer_status_{};
@@ -999,158 +1004,99 @@ class UsbBridgeComponent : public Component {
   }
 
   // ── TCP server per device ─────────────────────────────────
-  // ── MQTT ──────────────────────────────────────────────────
-  static void mqtt_event_handler_(void *arg, esp_event_base_t base, int32_t id, void *data) {
-    auto *self = static_cast<UsbBridgeComponent *>(arg);
-    auto *event = static_cast<esp_mqtt_event_handle_t>(data);
-    switch (id) {
-      case MQTT_EVENT_CONNECTED: {
-        BRIDGE_LOG("MQTT connected");
-        const char *dn = App.get_name().c_str();
-        if (self->settings_.mqtt_discovery)
-          self->mqtt_publish_discovery_();
-        self->mqtt_publish_state_();
-        // Publish online availability
-        char avail_t[96];
-        snprintf(avail_t, sizeof(avail_t), "%s/available", dn);
-        esp_mqtt_client_publish(self->mqtt_client_, avail_t, "online", 0, 1, 1);
-        // Subscribe to restart command
-        char restart_t[96];
-        snprintf(restart_t, sizeof(restart_t), "%s/restart", dn);
-        esp_mqtt_client_subscribe(self->mqtt_client_, restart_t, 0);
-        break;
-      }
-      case MQTT_EVENT_DATA:
-        // Handle restart command
-        if (event->topic && event->topic_len > 0) {
-          char cmd_t[96];
-          snprintf(cmd_t, sizeof(cmd_t), "%s/restart", App.get_name().c_str());
-          if (strncmp(event->topic, cmd_t, event->topic_len) == 0) {
-            BRIDGE_LOG("MQTT restart command received");
-            self->clean_reboot_();
-          }
-        }
-        break;
-      case MQTT_EVENT_DISCONNECTED:
-        BRIDGE_LOGW("MQTT disconnected");
-        break;
-      default: break;
+
+  // ── Native ESPHome sensors (replace MQTT) ─────────────────
+  void setup_sensors_() {
+    // Devices Connected sensor
+    devices_sensor_ = new sensor::Sensor();
+    devices_sensor_->set_name("Devices Connected");
+    devices_sensor_->set_object_id(std::string(App.get_name()) + "_devices_connected");
+    devices_sensor_->set_icon("mdi:usb");
+    devices_sensor_->set_accuracy_decimals(0);
+    devices_sensor_->set_state_class(sensor::STATE_CLASS_MEASUREMENT);
+    App.register_sensor(devices_sensor_);
+
+    // Firmware text sensor
+    firmware_sensor_ = new text_sensor::TextSensor();
+    firmware_sensor_->set_name("Firmware");
+    firmware_sensor_->set_object_id(std::string(App.get_name()) + "_firmware");
+    firmware_sensor_->set_icon("mdi:chip");
+    firmware_sensor_->set_entity_category(ENTITY_CATEGORY_DIAGNOSTIC);
+    App.register_text_sensor(firmware_sensor_);
+
+    // Device list text sensor (JSON)
+    device_list_sensor_ = new text_sensor::TextSensor();
+    device_list_sensor_->set_name("Device List");
+    device_list_sensor_->set_object_id(std::string(App.get_name()) + "_device_list");
+    device_list_sensor_->set_icon("mdi:format-list-bulleted");
+    device_list_sensor_->set_entity_category(ENTITY_CATEGORY_DIAGNOSTIC);
+    App.register_text_sensor(device_list_sensor_);
+
+    // Config URL text sensor (link to web UI)
+    auto *config_url = new text_sensor::TextSensor();
+    config_url->set_name("Config URL");
+    config_url->set_object_id(std::string(App.get_name()) + "_config_url");
+    config_url->set_icon("mdi:web");
+    config_url->set_entity_category(ENTITY_CATEGORY_DIAGNOSTIC);
+    App.register_text_sensor(config_url);
+
+    // Publish config URL once (doesn't change)
+    config_url_sensor_ = config_url;
+    publish_config_url_();
+
+    // Publish firmware once
+    firmware_sensor_->publish_state(FW_BUILD_ID);
+
+    // Initial sensor publish
+    publish_sensors_();
+    BRIDGE_LOG("ESPHome native sensors registered");
+  }
+
+  void publish_config_url_() {
+    if (config_url_published_) return;
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (!netif) return;
+    esp_netif_ip_info_t ip_info;
+    if (esp_netif_get_ip_info(netif, &ip_info) == ESP_OK && ip_info.ip.addr != 0) {
+      char url[64];
+      snprintf(url, sizeof(url), "http://" IPSTR "/", IP2STR(&ip_info.ip));
+      if (config_url_sensor_) config_url_sensor_->publish_state(url);
+      // Set web_server_url so HA device page shows "Visit" / "Konfiguration" link
+#ifdef USE_WEB_SERVER
+      App.set_web_server_url(url);
+#endif
+      config_url_published_ = true;
+      BRIDGE_LOG("Config URL: %s", url);
     }
   }
 
-  void mqtt_init_() {
-    const char *dev_name = App.get_name().c_str();
-    char uri[96];
-    snprintf(uri, sizeof(uri), "mqtt://%s:%d", settings_.mqtt_host, settings_.mqtt_port);
-
-    char lwt_topic[96];
-    snprintf(lwt_topic, sizeof(lwt_topic), "%s/available", dev_name);
-
-    esp_mqtt_client_config_t cfg = {};
-    cfg.broker.address.uri = uri;
-    if (settings_.mqtt_user[0]) cfg.credentials.username = settings_.mqtt_user;
-    if (settings_.mqtt_password[0]) cfg.credentials.authentication.password = settings_.mqtt_password;
-    cfg.session.last_will.topic = lwt_topic;
-    cfg.session.last_will.msg = "offline";
-    cfg.session.last_will.msg_len = 7;
-    cfg.session.last_will.qos = 1;
-    cfg.session.last_will.retain = 1;
-    cfg.session.keepalive = 30;  // MQTT PINGREQ every 30s
-
-    mqtt_client_ = esp_mqtt_client_init(&cfg);
-    if (!mqtt_client_) { BRIDGE_LOGE("MQTT client init failed"); return; }
-    esp_mqtt_client_register_event(mqtt_client_, (esp_mqtt_event_id_t)ESP_EVENT_ANY_ID, mqtt_event_handler_, this);
-    esp_mqtt_client_start(mqtt_client_);
-    BRIDGE_LOG("MQTT starting → %s", uri);
-  }
-
-  void mqtt_publish_discovery_() {
-    if (!mqtt_client_) return;
-    const char *dn = App.get_name().c_str();
-    const char *fn = App.get_friendly_name().c_str();
-    // Use friendly_name for display, fall back to name
-    const char *display = (fn && fn[0]) ? fn : dn;
-    char topic[128], payload[640];
-
-    // Binary sensor: bridge online (includes full device definition)
-    snprintf(topic, sizeof(topic), "homeassistant/binary_sensor/%s/online/config", dn);
-    snprintf(payload, sizeof(payload),
-      "{\"name\":\"Online\",\"uniq_id\":\"%s_online\","
-      "\"stat_t\":\"%s/available\",\"pl_on\":\"online\",\"pl_off\":\"offline\","
-      "\"dev_cla\":\"connectivity\","
-      "\"dev\":{\"ids\":[\"%s\"],\"name\":\"%s\",\"mf\":\"ESP32-S3\",\"mdl\":\"USB Gateway\",\"sw\":\"%s\"}}",
-      dn, dn, dn, display, FW_BUILD_ID);
-    esp_mqtt_client_publish(mqtt_client_, topic, payload, 0, 1, 1);
-
-    // Sensor: connected device count
-    snprintf(topic, sizeof(topic), "homeassistant/sensor/%s/devices/config", dn);
-    snprintf(payload, sizeof(payload),
-      "{\"name\":\"Devices Connected\",\"uniq_id\":\"%s_devices\","
-      "\"stat_t\":\"%s/state\",\"val_tpl\":\"{{value_json.devices_connected}}\","
-      "\"ic\":\"mdi:usb\","
-      "\"dev\":{\"ids\":[\"%s\"]}}",
-      dn, dn, dn);
-    esp_mqtt_client_publish(mqtt_client_, topic, payload, 0, 1, 1);
-
-    // Sensor: firmware
-    snprintf(topic, sizeof(topic), "homeassistant/sensor/%s/firmware/config", dn);
-    snprintf(payload, sizeof(payload),
-      "{\"name\":\"Firmware\",\"uniq_id\":\"%s_fw\","
-      "\"stat_t\":\"%s/state\",\"val_tpl\":\"{{value_json.firmware}}\","
-      "\"ic\":\"mdi:chip\",\"ent_cat\":\"diagnostic\","
-      "\"dev\":{\"ids\":[\"%s\"]}}",
-      dn, dn, dn);
-    esp_mqtt_client_publish(mqtt_client_, topic, payload, 0, 1, 1);
-
-    // Sensor: uptime
-    snprintf(topic, sizeof(topic), "homeassistant/sensor/%s/uptime/config", dn);
-    snprintf(payload, sizeof(payload),
-      "{\"name\":\"Uptime\",\"uniq_id\":\"%s_uptime\","
-      "\"stat_t\":\"%s/state\",\"val_tpl\":\"{{value_json.uptime}}\","
-      "\"unit_of_meas\":\"s\",\"ic\":\"mdi:timer-outline\",\"ent_cat\":\"diagnostic\","
-      "\"dev\":{\"ids\":[\"%s\"]}}",
-      dn, dn, dn);
-    esp_mqtt_client_publish(mqtt_client_, topic, payload, 0, 1, 1);
-
-    // Button: restart
-    snprintf(topic, sizeof(topic), "homeassistant/button/%s/restart/config", dn);
-    snprintf(payload, sizeof(payload),
-      "{\"name\":\"Restart\",\"uniq_id\":\"%s_restart\","
-      "\"cmd_t\":\"%s/restart\",\"ic\":\"mdi:restart\","
-      "\"dev\":{\"ids\":[\"%s\"]}}",
-      dn, dn, dn);
-    esp_mqtt_client_publish(mqtt_client_, topic, payload, 0, 1, 1);
-
-    BRIDGE_LOG("MQTT HA discovery published (device: %s)", display);
-  }
-
-  void mqtt_publish_state_() {
-    if (!mqtt_client_) return;
-    char topic[96], payload[512];
-    snprintf(topic, sizeof(topic), "%s/state", App.get_name().c_str());
-
+  void publish_sensors_() {
+    // Count connected devices
     int dev_connected = 0;
     for (auto *c : connections_) {
       if (c->connected.load()) dev_connected++;
     }
+    if (devices_sensor_) devices_sensor_->publish_state(dev_connected);
 
-    char *p = payload;
-    const char *end = payload + sizeof(payload) - 2;
-    p += snprintf(p, end - p,
-      "{\"online\":true,\"firmware\":\"%s\",\"uptime\":%lu,\"devices_connected\":%d,"
-      "\"devices_configured\":%zu,\"free_heap\":%lu,\"devices\":[",
-      FW_BUILD_ID, (unsigned long)(millis() / 1000), dev_connected,
-      connections_.size(), (unsigned long)esp_get_free_heap_size());
+    // Publish config URL if not yet published (IP might not be ready at setup)
+    if (!config_url_published_)
+      publish_config_url_();
 
-    for (size_t i = 0; i < connections_.size() && p < end - 100; i++) {
-      if (i > 0) *p++ = ',';
-      p += snprintf(p, end - p, "{\"name\":\"%s\",\"port\":%d,\"connected\":%s}",
-                    connections_[i]->config.name, connections_[i]->config.port,
-                    connections_[i]->connected.load() ? "true" : "false");
+    // Build device list JSON
+    if (device_list_sensor_) {
+      char payload[512];
+      char *p = payload;
+      const char *end = payload + sizeof(payload) - 2;
+      *p++ = '[';
+      for (size_t i = 0; i < connections_.size() && p < end - 80; i++) {
+        if (i > 0) *p++ = ',';
+        p += snprintf(p, end - p, "{\"name\":\"%s\",\"port\":%d,\"connected\":%s}",
+                      connections_[i]->config.name, connections_[i]->config.port,
+                      connections_[i]->connected.load() ? "true" : "false");
+      }
+      *p++ = ']'; *p = 0;
+      device_list_sensor_->publish_state(payload);
     }
-    p += snprintf(p, end - p, "]}");
-
-    esp_mqtt_client_publish(mqtt_client_, topic, payload, 0, 0, 0);
   }
 
   static void tcp_task_entry_(void *arg) {
