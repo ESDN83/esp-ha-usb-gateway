@@ -213,6 +213,7 @@ class UsbBridgeComponent : public Component {
 #ifdef USE_TEXT_SENSOR
   void set_firmware_sensor(text_sensor::TextSensor *sensor) { firmware_sensor_ = sensor; }
   void set_device_list_sensor(text_sensor::TextSensor *sensor) { device_list_sensor_ = sensor; }
+  void set_config_url_sensor(text_sensor::TextSensor *sensor) { config_url_sensor_ = sensor; }
 #endif
 
   float get_setup_priority() const override {
@@ -421,6 +422,8 @@ class UsbBridgeComponent : public Component {
 #ifdef USE_TEXT_SENSOR
   text_sensor::TextSensor *firmware_sensor_{nullptr};
   text_sensor::TextSensor *device_list_sensor_{nullptr};
+  text_sensor::TextSensor *config_url_sensor_{nullptr};
+  bool config_url_published_{false};
 #endif
   uint32_t last_sensor_publish_{0};
 
@@ -1035,6 +1038,20 @@ class UsbBridgeComponent : public Component {
     }
 #endif
 #ifdef USE_TEXT_SENSOR
+    // Publish config URL once (IP might not be ready at first call)
+    if (config_url_sensor_ && !config_url_published_) {
+      esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+      if (netif) {
+        esp_netif_ip_info_t ip_info;
+        if (esp_netif_get_ip_info(netif, &ip_info) == ESP_OK && ip_info.ip.addr != 0) {
+          char url[64];
+          snprintf(url, sizeof(url), "http://" IPSTR "/", IP2STR(&ip_info.ip));
+          config_url_sensor_->publish_state(url);
+          config_url_published_ = true;
+          BRIDGE_LOG("Config URL: %s", url);
+        }
+      }
+    }
     if (device_list_sensor_) {
       char payload[512];
       char *p = payload;
