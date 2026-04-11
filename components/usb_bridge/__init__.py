@@ -14,6 +14,7 @@ UsbBridgeComponent = usb_bridge_ns.class_("UsbBridgeComponent", cg.Component)
 CONF_DEVICES_SENSOR = "devices_connected"
 CONF_FIRMWARE_SENSOR = "firmware"
 CONF_DEVICE_LIST_SENSOR = "device_list"
+CONF_CONFIG_URL_SENSOR = "config_url"
 
 CONFIG_SCHEMA = cv.Schema(
     {
@@ -29,6 +30,10 @@ CONFIG_SCHEMA = cv.Schema(
         ),
         cv.Optional(CONF_DEVICE_LIST_SENSOR): text_sensor.text_sensor_schema(
             icon="mdi:format-list-bulleted",
+            entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+        ),
+        cv.Optional(CONF_CONFIG_URL_SENSOR): text_sensor.text_sensor_schema(
+            icon="mdi:web",
             entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
         ),
     }
@@ -50,6 +55,10 @@ async def to_code(config):
     if CONF_DEVICE_LIST_SENSOR in config:
         sens = await text_sensor.new_text_sensor(config[CONF_DEVICE_LIST_SENSOR])
         cg.add(var.set_device_list_sensor(sens))
+
+    if CONF_CONFIG_URL_SENSOR in config:
+        sens = await text_sensor.new_text_sensor(config[CONF_CONFIG_URL_SENSOR])
+        cg.add(var.set_config_url_sensor(sens))
 
     # USB host on ESP32-S3
     add_idf_sdkconfig_option("CONFIG_USB_OTG_SUPPORTED", True)

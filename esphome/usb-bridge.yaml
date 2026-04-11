@@ -76,3 +76,5 @@ usb_bridge:
     name: "Firmware"
   device_list:
     name: "Device List"
+  config_url:
+    name: "Config URL"
