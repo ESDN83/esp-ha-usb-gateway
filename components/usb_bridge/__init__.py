@@ -96,6 +96,12 @@ async def to_code(config):
             status_sens = await text_sensor.new_text_sensor(dev_conf[CONF_DEVICE_STATUS])
             cg.add(var.set_device_status_sensor(i, status_sens))
 
+    # Tell ESPHome API that our config UI is on port 80
+    # so HA shows the "Visit" button on the device page.
+    # The API response uses: #ifdef USE_WEBSERVER → resp.webserver_port = USE_WEBSERVER_PORT
+    cg.add_define("USE_WEBSERVER")
+    cg.add_define("USE_WEBSERVER_PORT", 80)
+
     # USB host on ESP32-S3
     add_idf_sdkconfig_option("CONFIG_USB_OTG_SUPPORTED", True)
     add_idf_sdkconfig_option("CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE", 1024)
