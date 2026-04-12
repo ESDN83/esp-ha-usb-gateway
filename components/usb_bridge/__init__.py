@@ -13,8 +13,30 @@ UsbBridgeComponent = usb_bridge_ns.class_("UsbBridgeComponent", cg.Component)
 
 CONF_DEVICES_SENSOR = "devices_connected"
 CONF_FIRMWARE_SENSOR = "firmware"
-CONF_DEVICE_LIST_SENSOR = "device_list"
 CONF_CONFIG_URL_SENSOR = "config_url"
+
+# Per-device sensors (up to 8 slots)
+MAX_DEVICE_SLOTS = 8
+CONF_DEVICE_NAME = "device_name"
+CONF_DEVICE_PORT = "device_port"
+CONF_DEVICE_STATUS = "device_status"
+
+DEVICE_SENSOR_SCHEMA = cv.Schema(
+    {
+        cv.Required(CONF_DEVICE_NAME): text_sensor.text_sensor_schema(
+            icon="mdi:usb",
+        ),
+        cv.Required(CONF_DEVICE_PORT): sensor.sensor_schema(
+            icon="mdi:lan-connect",
+            accuracy_decimals=0,
+        ),
+        cv.Required(CONF_DEVICE_STATUS): text_sensor.text_sensor_schema(
+            icon="mdi:lan-check",
+        ),
+    }
+)
+
+CONF_DEVICES = "devices"
 
 CONFIG_SCHEMA = cv.Schema(
     {
@@ -28,13 +50,13 @@ CONFIG_SCHEMA = cv.Schema(
             icon="mdi:chip",
             entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
         ),
-        cv.Optional(CONF_DEVICE_LIST_SENSOR): text_sensor.text_sensor_schema(
-            icon="mdi:format-list-bulleted",
-            entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
-        ),
         cv.Optional(CONF_CONFIG_URL_SENSOR): text_sensor.text_sensor_schema(
             icon="mdi:web",
             entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+        ),
+        cv.Optional(CONF_DEVICES): cv.All(
+            cv.ensure_list(DEVICE_SENSOR_SCHEMA),
+            cv.Length(max=MAX_DEVICE_SLOTS),
         ),
     }
 ).extend(cv.COMPONENT_SCHEMA)
@@ -52,13 +74,19 @@ async def to_code(config):
         sens = await text_sensor.new_text_sensor(config[CONF_FIRMWARE_SENSOR])
         cg.add(var.set_firmware_sensor(sens))
 
-    if CONF_DEVICE_LIST_SENSOR in config:
-        sens = await text_sensor.new_text_sensor(config[CONF_DEVICE_LIST_SENSOR])
-        cg.add(var.set_device_list_sensor(sens))
-
     if CONF_CONFIG_URL_SENSOR in config:
         sens = await text_sensor.new_text_sensor(config[CONF_CONFIG_URL_SENSOR])
         cg.add(var.set_config_url_sensor(sens))
+
+    # Per-device sensor slots
+    if CONF_DEVICES in config:
+        for i, dev_conf in enumerate(config[CONF_DEVICES]):
+            name_sens = await text_sensor.new_text_sensor(dev_conf[CONF_DEVICE_NAME])
+            cg.add(var.set_device_name_sensor(i, name_sens))
+            port_sens = await sensor.new_sensor(dev_conf[CONF_DEVICE_PORT])
+            cg.add(var.set_device_port_sensor(i, port_sens))
+            status_sens = await text_sensor.new_text_sensor(dev_conf[CONF_DEVICE_STATUS])
+            cg.add(var.set_device_status_sensor(i, status_sens))
 
     # USB host on ESP32-S3
     add_idf_sdkconfig_option("CONFIG_USB_OTG_SUPPORTED", True)
