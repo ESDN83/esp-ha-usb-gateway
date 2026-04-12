@@ -1,5 +1,11 @@
 # ESP HA USB Gateway
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![ESPHome](https://img.shields.io/badge/ESPHome-Component-blue.svg)](https://esphome.io/)
+[![Home Assistant](https://img.shields.io/badge/Home%20Assistant-Integration-41BDF5.svg)](https://www.home-assistant.io/)
+[![ESP32-S3](https://img.shields.io/badge/ESP32--S3-USB%20Host-red.svg)](https://www.espressif.com/en/products/socs/esp32-s3)
+[![GitHub Release](https://img.shields.io/github/v/release/ESDN83/esp-ha-usb-gateway)](https://github.com/ESDN83/esp-ha-usb-gateway/releases)
+
 ESP32-S3 USB-to-TCP bridge for Home Assistant. Bridges USB serial devices (Zigbee sticks, EnOcean, FTDI) over WiFi to TCP sockets — no USB passthrough needed. Enables **VM live migration** in Proxmox/ESXi environments.
 
 ## How It Works
