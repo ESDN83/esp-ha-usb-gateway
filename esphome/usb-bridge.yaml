@@ -74,7 +74,20 @@ usb_bridge:
     name: "Devices Connected"
   firmware:
     name: "Firmware"
-  device_list:
-    name: "Device List"
   config_url:
     name: "Config URL"
+  # Per-device sensors (one group per USB device slot)
+  # Each slot exposes: device_name (text), device_port (number), device_status (text)
+  devices:
+    - device_name:
+        name: "Device 1 Name"
+      device_port:
+        name: "Device 1 Port"
+      device_status:
+        name: "Device 1 Status"
+    - device_name:
+        name: "Device 2 Name"
+      device_port:
+        name: "Device 2 Port"
+      device_status:
+        name: "Device 2 Status"

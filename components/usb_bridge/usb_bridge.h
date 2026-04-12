@@ -206,14 +206,24 @@ class UsbBridgeComponent : public Component {
   SemaphoreHandle_t get_discovery_mutex() { return discovery_mutex_; }
   const BridgeSettings& get_settings() { return settings_; }
 
+  static constexpr int MAX_DEVICE_SLOTS = 8;
+
   // Sensor setters (called by codegen from __init__.py)
 #ifdef USE_SENSOR
   void set_devices_sensor(sensor::Sensor *sensor) { devices_sensor_ = sensor; }
+  void set_device_port_sensor(int index, sensor::Sensor *sensor) {
+    if (index >= 0 && index < MAX_DEVICE_SLOTS) device_port_sensors_[index] = sensor;
+  }
 #endif
 #ifdef USE_TEXT_SENSOR
   void set_firmware_sensor(text_sensor::TextSensor *sensor) { firmware_sensor_ = sensor; }
-  void set_device_list_sensor(text_sensor::TextSensor *sensor) { device_list_sensor_ = sensor; }
   void set_config_url_sensor(text_sensor::TextSensor *sensor) { config_url_sensor_ = sensor; }
+  void set_device_name_sensor(int index, text_sensor::TextSensor *sensor) {
+    if (index >= 0 && index < MAX_DEVICE_SLOTS) device_name_sensors_[index] = sensor;
+  }
+  void set_device_status_sensor(int index, text_sensor::TextSensor *sensor) {
+    if (index >= 0 && index < MAX_DEVICE_SLOTS) device_status_sensors_[index] = sensor;
+  }
 #endif
 
   float get_setup_priority() const override {
@@ -418,11 +428,13 @@ class UsbBridgeComponent : public Component {
   // Native ESPHome sensors (set by codegen, replace MQTT)
 #ifdef USE_SENSOR
   sensor::Sensor *devices_sensor_{nullptr};
+  sensor::Sensor *device_port_sensors_[MAX_DEVICE_SLOTS]{};
 #endif
 #ifdef USE_TEXT_SENSOR
   text_sensor::TextSensor *firmware_sensor_{nullptr};
-  text_sensor::TextSensor *device_list_sensor_{nullptr};
   text_sensor::TextSensor *config_url_sensor_{nullptr};
+  text_sensor::TextSensor *device_name_sensors_[MAX_DEVICE_SLOTS]{};
+  text_sensor::TextSensor *device_status_sensors_[MAX_DEVICE_SLOTS]{};
   bool config_url_published_{false};
 #endif
   uint32_t last_sensor_publish_{0};
@@ -1040,8 +1052,11 @@ class UsbBridgeComponent : public Component {
 #ifdef USE_TEXT_SENSOR
     // Publish config URL once (IP might not be ready at first call)
     if (config_url_sensor_ && !config_url_published_) {
-      esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-      if (netif) {
+      // Try WiFi first, then Ethernet (Waveshare ETH variant)
+      const char *if_keys[] = {"WIFI_STA_DEF", "ETH_DEF", nullptr};
+      for (int k = 0; if_keys[k]; k++) {
+        esp_netif_t *netif = esp_netif_get_handle_from_ifkey(if_keys[k]);
+        if (!netif) continue;
         esp_netif_ip_info_t ip_info;
         if (esp_netif_get_ip_info(netif, &ip_info) == ESP_OK && ip_info.ip.addr != 0) {
           char url[64];
@@ -1049,22 +1064,39 @@ class UsbBridgeComponent : public Component {
           config_url_sensor_->publish_state(url);
           config_url_published_ = true;
           BRIDGE_LOG("Config URL: %s", url);
+          break;
         }
       }
     }
-    if (device_list_sensor_) {
-      char payload[512];
-      char *p = payload;
-      const char *end = payload + sizeof(payload) - 2;
-      *p++ = '[';
-      for (size_t i = 0; i < connections_.size() && p < end - 80; i++) {
-        if (i > 0) *p++ = ',';
-        p += snprintf(p, end - p, "{\"name\":\"%s\",\"port\":%d,\"connected\":%s}",
-                      connections_[i]->config.name, connections_[i]->config.port,
-                      connections_[i]->connected.load() ? "true" : "false");
+    // Per-device sensors: name, port, status for each configured slot
+    for (int i = 0; i < MAX_DEVICE_SLOTS; i++) {
+      bool has_any = device_name_sensors_[i] || device_status_sensors_[i];
+#ifdef USE_SENSOR
+      has_any = has_any || device_port_sensors_[i];
+#endif
+      if (!has_any) continue;
+
+      if (i < (int)connections_.size()) {
+        auto *conn = connections_[i];
+        if (device_name_sensors_[i])
+          device_name_sensors_[i]->publish_state(conn->config.name);
+        if (device_status_sensors_[i])
+          device_status_sensors_[i]->publish_state(conn->connected.load() ? "Connected" : "Disconnected");
+#ifdef USE_SENSOR
+        if (device_port_sensors_[i])
+          device_port_sensors_[i]->publish_state(conn->config.port);
+#endif
+      } else {
+        // Slot has no device assigned
+        if (device_name_sensors_[i])
+          device_name_sensors_[i]->publish_state("—");
+        if (device_status_sensors_[i])
+          device_status_sensors_[i]->publish_state("No Device");
+#ifdef USE_SENSOR
+        if (device_port_sensors_[i])
+          device_port_sensors_[i]->publish_state(0);
+#endif
       }
-      *p++ = ']'; *p = 0;
-      device_list_sensor_->publish_state(payload);
     }
 #endif
   }
