@@ -16,7 +16,7 @@ USB Devices ←→ USB Hub ←→ ESP32-S3 (USB Host OTG) ←→ TCP Sockets ←
 
 <img width="1594" height="1635" alt="grafik" src="https://github.com/user-attachments/assets/b5bfc47b-279f-4925-9bf0-9386fc8666e8" />
 
-<img width="1546" height="1440" alt="grafik" src="https://github.com/user-attachments/assets/cd9c2eeb-ed87-4218-9cf7-914446acd3e5" />
+<img width="1411" height="1408" alt="grafik" src="https://github.com/user-attachments/assets/11c5367f-a636-4530-a175-f2445f427f08" />
 
 ## Supported Devices
 
