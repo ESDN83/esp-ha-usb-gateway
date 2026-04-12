@@ -34,7 +34,8 @@ USB Devices ←→ USB Hub ←→ ESP32-S3 (USB Host OTG) ←→ TCP Sockets ←
 - **Web UI** — auto-detect USB devices, assign TCP ports, configure settings
 - **Password protection** — HTTP Basic Auth for web UI (TCP serial ports remain open)
 - **IP whitelist** — per-device restriction of which hosts can connect to serial ports
-- **MQTT with HA Auto Discovery** — bridge status, device count, uptime, firmware, restart button
+- **Native ESPHome API** — no MQTT needed; sensors appear directly in Home Assistant
+- **Per-device sensors** — each USB device gets individual name, port, and status entities in HA
 - **Multiple bridges** — each bridge uses its ESPHome `friendly_name` for unique identification
 
 ## Hardware Requirements
@@ -53,7 +54,7 @@ USB Devices ←→ USB Hub ←→ ESP32-S3 (USB Host OTG) ←→ TCP Sockets ←
 
 4. Connect your integration to `tcp://<ESP_IP>:<port>` (e.g. Zigbee2MQTT `serial.port`)
 
-5. Optional: Set admin password, IP whitelist, and MQTT in the Settings section
+5. Optional: Set admin password and IP whitelist in the Settings section
 
 ## Example Configs
 
@@ -105,16 +106,24 @@ button:
   - platform: restart
     name: Restart
 
-# USB Bridge mit Sensoren
+# USB Bridge with sensors
 usb_bridge:
   devices_connected:
     name: "Devices Connected"
   firmware:
     name: "Firmware"
-  device_list:
-    name: "Device List"
   config_url:
     name: "Config URL"
+  ip_address:
+    name: "IP Address"
+  # One entry per USB device slot (up to 8)
+  devices:
+    - device_name:
+        name: "Device 1 Name"
+      device_port:
+        name: "Device 1 Port"
+      device_status:
+        name: "Device 1 Status"
 ```
 
 ### Ethernet (Waveshare ESP32-S3 ETH with W5500)
@@ -175,16 +184,23 @@ button:
   - platform: restart
     name: Restart
 
-# USB Bridge mit Sensoren
+# USB Bridge with sensors
 usb_bridge:
   devices_connected:
     name: "Devices Connected"
   firmware:
     name: "Firmware"
-  device_list:
-    name: "Device List"
   config_url:
     name: "Config URL"
+  ip_address:
+    name: "IP Address"
+  devices:
+    - device_name:
+        name: "Device 1 Name"
+      device_port:
+        name: "Device 1 Port"
+      device_status:
+        name: "Device 1 Status"
 ```
 
 ## Web UI
@@ -193,8 +209,29 @@ Built-in config interface at `http://<ESP_IP>/`:
 - Auto-detected USB devices with manufacturer, product, serial number
 - One-click device-to-TCP-port assignment
 - Per-device IP whitelist (restrict which hosts can connect)
-- Settings: admin password, MQTT with HA Auto Discovery
+- Settings: admin password
 - Debug log viewer
+
+## Home Assistant Sensors
+
+The component exposes the following entities per bridge in HA (via native ESPHome API):
+
+| Sensor | Type | Example Value |
+|--------|------|---------------|
+| Devices Connected | numeric | `1` |
+| Firmware | text | `usb-bridge build 2026-04-11-a` |
+| Config URL | text | `http://192.168.1.18/` |
+| IP Address | text | `192.168.1.18` |
+| Uptime | numeric | `3600` |
+| Restart | button | — |
+
+Per USB device slot (up to 8):
+
+| Sensor | Type | Example Value |
+|--------|------|---------------|
+| Device *N* Name | text | `SkyConnect v1.0` |
+| Device *N* Port | text | `8880` |
+| Device *N* Status | text | `Connected` / `Disconnected` |
 
 ## Zigbee2MQTT Example
 
