@@ -76,8 +76,9 @@ usb_bridge:
     name: "Firmware"
   config_url:
     name: "Config URL"
+  ip_address:
+    name: "IP Address"
   # Per-device sensors (one group per USB device slot)
-  # Each slot exposes: device_name (text), device_port (number), device_status (text)
   devices:
     - device_name:
         name: "Device 1 Name"

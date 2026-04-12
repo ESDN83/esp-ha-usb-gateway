@@ -14,6 +14,7 @@ UsbBridgeComponent = usb_bridge_ns.class_("UsbBridgeComponent", cg.Component)
 CONF_DEVICES_SENSOR = "devices_connected"
 CONF_FIRMWARE_SENSOR = "firmware"
 CONF_CONFIG_URL_SENSOR = "config_url"
+CONF_IP_ADDRESS_SENSOR = "ip_address"
 
 # Per-device sensors (up to 8 slots)
 MAX_DEVICE_SLOTS = 8
@@ -26,9 +27,8 @@ DEVICE_SENSOR_SCHEMA = cv.Schema(
         cv.Required(CONF_DEVICE_NAME): text_sensor.text_sensor_schema(
             icon="mdi:usb",
         ),
-        cv.Required(CONF_DEVICE_PORT): sensor.sensor_schema(
+        cv.Required(CONF_DEVICE_PORT): text_sensor.text_sensor_schema(
             icon="mdi:lan-connect",
-            accuracy_decimals=0,
         ),
         cv.Required(CONF_DEVICE_STATUS): text_sensor.text_sensor_schema(
             icon="mdi:lan-check",
@@ -52,6 +52,10 @@ CONFIG_SCHEMA = cv.Schema(
         ),
         cv.Optional(CONF_CONFIG_URL_SENSOR): text_sensor.text_sensor_schema(
             icon="mdi:web",
+            entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+        ),
+        cv.Optional(CONF_IP_ADDRESS_SENSOR): text_sensor.text_sensor_schema(
+            icon="mdi:ip-network",
             entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
         ),
         cv.Optional(CONF_DEVICES): cv.All(
@@ -78,12 +82,16 @@ async def to_code(config):
         sens = await text_sensor.new_text_sensor(config[CONF_CONFIG_URL_SENSOR])
         cg.add(var.set_config_url_sensor(sens))
 
+    if CONF_IP_ADDRESS_SENSOR in config:
+        sens = await text_sensor.new_text_sensor(config[CONF_IP_ADDRESS_SENSOR])
+        cg.add(var.set_ip_address_sensor(sens))
+
     # Per-device sensor slots
     if CONF_DEVICES in config:
         for i, dev_conf in enumerate(config[CONF_DEVICES]):
             name_sens = await text_sensor.new_text_sensor(dev_conf[CONF_DEVICE_NAME])
             cg.add(var.set_device_name_sensor(i, name_sens))
-            port_sens = await sensor.new_sensor(dev_conf[CONF_DEVICE_PORT])
+            port_sens = await text_sensor.new_text_sensor(dev_conf[CONF_DEVICE_PORT])
             cg.add(var.set_device_port_sensor(i, port_sens))
             status_sens = await text_sensor.new_text_sensor(dev_conf[CONF_DEVICE_STATUS])
             cg.add(var.set_device_status_sensor(i, status_sens))
