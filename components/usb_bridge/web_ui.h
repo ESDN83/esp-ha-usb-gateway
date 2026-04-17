@@ -213,12 +213,54 @@ static bool json_get_bool(const char *json, const char *key, bool def = false) {
 }
 static void json_get_str(const char *json, const char *key, char *out, size_t max_len) {
   out[0] = 0;
+  if (max_len == 0) return;
   const char *v = json_find_key(json, key);
   if (!v || *v != '"') return;
   v++;
   size_t i = 0;
-  while (*v && *v != '"' && i < max_len - 1) out[i++] = *v++;
+  while (*v && i < max_len - 1) {
+    if (*v == '"') break;
+    if (*v == '\\' && *(v + 1)) {
+      v++;
+      switch (*v) {
+        case 'n': out[i++] = '\n'; break;
+        case 't': out[i++] = '\t'; break;
+        case 'r': out[i++] = '\r'; break;
+        case '"': out[i++] = '"'; break;
+        case '\\': out[i++] = '\\'; break;
+        case '/': out[i++] = '/'; break;
+        default: out[i++] = *v; break;
+      }
+      v++;
+    } else {
+      out[i++] = *v++;
+    }
+  }
   out[i] = 0;
+}
+
+// Find the matching closing brace for the object starting at obj_start,
+// respecting string boundaries and escapes. Returns nullptr on malformed input.
+static const char *json_find_obj_end(const char *obj_start) {
+  if (!obj_start || *obj_start != '{') return nullptr;
+  int depth = 0;
+  bool in_string = false;
+  bool escape = false;
+  for (const char *p = obj_start; *p; p++) {
+    if (escape) { escape = false; continue; }
+    if (in_string) {
+      if (*p == '\\') { escape = true; continue; }
+      if (*p == '"') in_string = false;
+      continue;
+    }
+    if (*p == '"') { in_string = true; continue; }
+    if (*p == '{') depth++;
+    else if (*p == '}') {
+      depth--;
+      if (depth == 0) return p;
+    }
+  }
+  return nullptr;
 }
 
 // ── HTML/CSS/JS embedded web page ───────────────────────────
