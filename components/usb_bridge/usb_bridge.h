@@ -205,6 +205,11 @@ class UsbBridgeComponent : public Component {
   std::vector<DiscoveredDevice>& get_discovered() { return discovered_; }
   SemaphoreHandle_t get_discovery_mutex() { return discovery_mutex_; }
   const BridgeSettings& get_settings() { return settings_; }
+  // Update cached settings AND persist to NVS so subsequent reads hit the cache.
+  bool set_settings(const BridgeSettings &s) {
+    settings_ = s;
+    return nvs_save_settings(s);
+  }
 
   static constexpr int MAX_DEVICE_SLOTS = 8;
 
@@ -1265,14 +1270,78 @@ static esp_err_t handle_get_status_(httpd_req_t *req) {
 }
 
 static esp_err_t handle_get_log_(httpd_req_t *req) {
-  BridgeSettings s; nvs_load_settings(s);
-  if (!check_admin_auth_(req, s.admin_password)) return ESP_OK;
+  auto *comp = web_ctx_.component;
+  if (!comp) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No component"); return ESP_FAIL; }
+  if (!check_admin_auth_(req, comp->get_settings().admin_password)) return ESP_OK;
   char *buf = (char *)malloc(LOG_RING_SIZE + 1);
   if (!buf) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM"); return ESP_FAIL; }
   size_t len = log_ring_read_(buf, LOG_RING_SIZE);
   httpd_resp_set_type(req, "text/plain");
   httpd_resp_send(req, buf, len);
   free(buf);
+  return ESP_OK;
+}
+
+static esp_err_t handle_root_(httpd_req_t *req) {
+  auto *comp = web_ctx_.component;
+  if (!comp) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No component"); return ESP_FAIL; }
+  if (!check_admin_auth_(req, comp->get_settings().admin_password)) return ESP_OK;
+  httpd_resp_set_type(req, "text/html");
+  httpd_resp_send(req, HTML_PAGE, sizeof(HTML_PAGE) - 1);
+  return ESP_OK;
+}
+
+static esp_err_t handle_get_settings_(httpd_req_t *req) {
+  auto *comp = web_ctx_.component;
+  if (!comp) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No component"); return ESP_FAIL; }
+  const auto &s = comp->get_settings();
+  char buf[128]; char *p = buf; const char *end = buf + sizeof(buf) - 2;
+  *p++ = '{';
+  json_append_bool(p, end, "has_password", s.admin_password[0] != '\0', false);
+  *p++ = '}'; *p = 0;
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_send(req, buf, p - buf);
+  return ESP_OK;
+}
+
+static esp_err_t handle_post_settings_(httpd_req_t *req) {
+  auto *comp = web_ctx_.component;
+  if (!comp) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No component"); return ESP_FAIL; }
+  if (!check_admin_auth_(req, comp->get_settings().admin_password)) return ESP_OK;
+
+  int total_len = req->content_len;
+  if (total_len > 1024) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Too large"); return ESP_FAIL; }
+  char *body = (char *)malloc(total_len + 1);
+  if (!body) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM"); return ESP_FAIL; }
+  int received = 0;
+  while (received < total_len) {
+    int ret = httpd_req_recv(req, body + received, total_len - received);
+    if (ret <= 0) { free(body); return ESP_FAIL; }
+    received += ret;
+  }
+  body[total_len] = 0;
+
+  BridgeSettings s = comp->get_settings();  // start from cached settings
+  char new_pw[32] = {};
+  json_get_str(body, "password", new_pw, sizeof(new_pw));
+  if (new_pw[0]) strncpy(s.admin_password, new_pw, sizeof(s.admin_password) - 1);
+  free(body);
+
+  comp->set_settings(s);
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_sendstr(req, "{\"message\":\"Settings saved!\",\"ok\":true}");
+  return ESP_OK;
+}
+
+static esp_err_t handle_clear_password_(httpd_req_t *req) {
+  auto *comp = web_ctx_.component;
+  if (!comp) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No component"); return ESP_FAIL; }
+  if (!check_admin_auth_(req, comp->get_settings().admin_password)) return ESP_OK;
+  BridgeSettings s = comp->get_settings();
+  s.admin_password[0] = '\0';
+  comp->set_settings(s);
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_sendstr(req, "{\"message\":\"Admin password removed.\",\"ok\":true}");
   return ESP_OK;
 }
 
