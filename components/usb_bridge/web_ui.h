@@ -123,10 +123,11 @@ static bool is_ip_allowed(const char *ip, const char *allowed_list) {
   char list[256];
   strncpy(list, allowed_list, sizeof(list) - 1);
   list[sizeof(list) - 1] = 0;
-  char *token = strtok(list, ", ");
+  char *saveptr = nullptr;
+  char *token = strtok_r(list, ", ", &saveptr);
   while (token) {
     if (strcmp(token, ip) == 0) return true;
-    token = strtok(nullptr, ", ");
+    token = strtok_r(nullptr, ", ", &saveptr);
   }
   return false;
 }
@@ -330,7 +331,7 @@ function renderDiscovered(){
     c.innerHTML+=`<div class="card discovered">
       <strong>${esc(name)}</strong> ${mfr?'<span class="chip-badge">'+esc(mfr)+'</span>':''} ${st}
       <div class="dev-info">VID: ${hex4(d.vid)} &middot; PID: ${hex4(d.pid)} &middot; Addr: ${d.addr} &middot; Intf: ${d.interfaces||1}${sn}</div>
-      ${assigned?'':'<button class="btn btn-add" onclick=\'addFromDevice('+d.vid+','+d.pid+','+JSON.stringify(name)+','+JSON.stringify(d.serial||"")+','+d.interfaces+')\'>+ Configure</button>'}
+      ${assigned?'':`<button class="btn btn-add add-btn" data-vid="${d.vid}" data-pid="${d.pid}" data-name="${esc(name)}" data-serial="${esc(d.serial||'')}" data-intf="${d.interfaces||1}">+ Configure</button>`}
     </div>`;
   });
 }
@@ -364,6 +365,10 @@ function renderConfigs(){
   });
 }
 
+document.getElementById('discovered').addEventListener('click',e=>{
+  const b=e.target.closest('.add-btn');if(!b)return;
+  addFromDevice(parseInt(b.dataset.vid),parseInt(b.dataset.pid),b.dataset.name,b.dataset.serial,parseInt(b.dataset.intf));
+});
 function addFromDevice(vid,pid,name,serial,intfCount){
   if(configs.some(c=>c.vid===vid&&c.pid===pid&&(!serial||c.serial===serial))){
     toast('Device already configured!',true);return;
@@ -487,6 +492,12 @@ loadLog();
 loadSettings();
 
 // Auto-refresh status (don't overwrite local unsaved config changes)
+// Skip re-rendering configs if the user is actively editing an input there,
+// otherwise the cursor jumps out every 5 seconds.
+function isEditingConfigs(){
+  const a=document.activeElement;
+  return a&&a.closest&&a.closest('#configured');
+}
 setInterval(()=>{
   fetch('/api/usb/status').then(r=>r.json()).then(st=>{
     if(st.configured){
@@ -495,7 +506,8 @@ setInterval(()=>{
       });
     }
     discovered=st.discovered||[];
-    renderDiscovered();renderConfigs();
+    renderDiscovered();
+    if(!isEditingConfigs()) renderConfigs();
   }).catch(()=>{});
 },5000);
 
@@ -514,74 +526,16 @@ struct WebContext {
 
 static WebContext web_ctx_;
 
-static esp_err_t handle_root_(httpd_req_t *req) {
-  BridgeSettings s;
-  nvs_load_settings(s);
-  if (!check_admin_auth_(req, s.admin_password)) return ESP_OK;
-  httpd_resp_set_type(req, "text/html");
-  httpd_resp_send(req, HTML_PAGE, sizeof(HTML_PAGE) - 1);
-  return ESP_OK;
-}
-
-// Implemented after UsbBridgeComponent class definition in usb_bridge.h
+// All HTTP handlers are implemented after UsbBridgeComponent class definition
+// in usb_bridge.h so they can access the component's cached settings.
+static esp_err_t handle_root_(httpd_req_t *req);
 static esp_err_t handle_get_config_(httpd_req_t *req);
 static esp_err_t handle_post_config_(httpd_req_t *req);
 static esp_err_t handle_get_status_(httpd_req_t *req);
 static esp_err_t handle_get_log_(httpd_req_t *req);
-
-// Settings handlers (self-contained, no component access needed)
-static esp_err_t handle_get_settings_(httpd_req_t *req) {
-  BridgeSettings s;
-  nvs_load_settings(s);
-  char buf[128]; char *p = buf; const char *end = buf + sizeof(buf) - 2;
-  *p++ = '{';
-  json_append_bool(p, end, "has_password", s.admin_password[0] != '\0', false);
-  *p++ = '}'; *p = 0;
-  httpd_resp_set_type(req, "application/json");
-  httpd_resp_send(req, buf, p - buf);
-  return ESP_OK;
-}
-
-static esp_err_t handle_post_settings_(httpd_req_t *req) {
-  // Check auth with current password
-  BridgeSettings cur;
-  nvs_load_settings(cur);
-  if (!check_admin_auth_(req, cur.admin_password)) return ESP_OK;
-
-  int total_len = req->content_len;
-  if (total_len > 1024) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Too large"); return ESP_FAIL; }
-  char *body = (char *)malloc(total_len + 1);
-  if (!body) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM"); return ESP_FAIL; }
-  int received = 0;
-  while (received < total_len) {
-    int ret = httpd_req_recv(req, body + received, total_len - received);
-    if (ret <= 0) { free(body); return ESP_FAIL; }
-    received += ret;
-  }
-  body[total_len] = 0;
-
-  BridgeSettings s = cur;  // start from current settings
-  char new_pw[32] = {};
-  json_get_str(body, "password", new_pw, sizeof(new_pw));
-  if (new_pw[0]) strncpy(s.admin_password, new_pw, sizeof(s.admin_password) - 1);
-  free(body);
-
-  nvs_save_settings(s);
-  httpd_resp_set_type(req, "application/json");
-  httpd_resp_sendstr(req, "{\"message\":\"Settings saved!\",\"ok\":true}");
-  return ESP_OK;
-}
-
-static esp_err_t handle_clear_password_(httpd_req_t *req) {
-  BridgeSettings cur;
-  nvs_load_settings(cur);
-  if (!check_admin_auth_(req, cur.admin_password)) return ESP_OK;
-  cur.admin_password[0] = '\0';
-  nvs_save_settings(cur);
-  httpd_resp_set_type(req, "application/json");
-  httpd_resp_sendstr(req, "{\"message\":\"Admin password removed.\",\"ok\":true}");
-  return ESP_OK;
-}
+static esp_err_t handle_get_settings_(httpd_req_t *req);
+static esp_err_t handle_post_settings_(httpd_req_t *req);
+static esp_err_t handle_clear_password_(httpd_req_t *req);
 
 static httpd_handle_t start_config_webserver_(int port) {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
