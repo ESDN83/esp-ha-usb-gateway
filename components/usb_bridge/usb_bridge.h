@@ -320,10 +320,14 @@ class UsbBridgeComponent : public Component {
       xSemaphoreGive(discovery_mutex_);
       if (dev_count == 0) {
         BRIDGE_LOGW("No USB devices after 10s — cold boot retry: reinstalling USB host...");
-        // Deregister client
+        // Null the handle FIRST so usb_task_ stops using it, then wait
+        // longer than its 100ms handle_events timeout so any in-flight call
+        // has returned before we deregister.
         if (client_hdl_) {
-          usb_host_client_deregister(client_hdl_);
+          auto old_hdl = client_hdl_;
           client_hdl_ = nullptr;
+          vTaskDelay(pdMS_TO_TICKS(150));
+          usb_host_client_deregister(old_hdl);
         }
         uint32_t flags = 0;
         usb_host_lib_handle_events(pdMS_TO_TICKS(100), &flags);
@@ -486,7 +490,10 @@ class UsbBridgeComponent : public Component {
       strncpy(conn->config.serial, s.serial, sizeof(conn->config.serial) - 1);
       strncpy(conn->config.allowed_ips, s.allowed_ips, sizeof(conn->config.allowed_ips) - 1);
       conn->parent = this;
-      conn->usb_mutex = xSemaphoreCreateMutex();
+      // Recursive: ctrl_transfer_sync_ pumps events, and if DEV_GONE fires
+      // for this same device during chip init, close_device_ re-enters the
+      // mutex on the same task.
+      conn->usb_mutex = xSemaphoreCreateRecursiveMutex();
       connections_.push_back(conn);
       BRIDGE_LOG("  Config: %s VID=%04X PID=%04X S/N=%s port=%d baud=%d",
                s.name, s.vid, s.pid, s.serial[0] ? s.serial : "(none)", s.port, s.baud_rate);
@@ -660,13 +667,13 @@ class UsbBridgeComponent : public Component {
       return;
     }
 
-    xSemaphoreTake(target->usb_mutex, portMAX_DELAY);
+    // Hold usb_mutex across chip init. ctrl_transfer_sync_ pumps events, so a
+    // DEV_GONE for this device could fire mid-init; recursive mutex means
+    // close_device_ can enter, null out dev_hdl, and we detect that below.
+    xSemaphoreTakeRecursive(target->usb_mutex, portMAX_DELAY);
     target->dev_hdl = dev;
     target->dev_addr = dev_addr;
-    xSemaphoreGive(target->usb_mutex);
 
-    // Chip-specific initialization (control transfers now work because
-    // we're NOT inside the event callback — monitor task pumps events)
     if (target->chip_type == ChipType::FTDI) {
       BRIDGE_LOG("  Initializing FTDI (%d baud)...", target->config.baud_rate);
       ftdi_init_(target);
@@ -679,7 +686,16 @@ class UsbBridgeComponent : public Component {
       cdc_acm_init_(target);
     }
 
+    // Bail if the device went away during init — don't spawn bulk_read task
+    // with a closed handle.
+    if (!target->dev_hdl) {
+      BRIDGE_LOGW("  Device disconnected during chip init — abort");
+      xSemaphoreGiveRecursive(target->usb_mutex);
+      return;
+    }
+
     target->connected.store(true);
+    xSemaphoreGiveRecursive(target->usb_mutex);
 
     // Mark as assigned in discovery list (by address, not VID/PID)
     xSemaphoreTake(discovery_mutex_, portMAX_DELAY);
@@ -865,6 +881,20 @@ class UsbBridgeComponent : public Component {
     BRIDGE_LOG("    CP210X SET_BAUDRATE(%d): %s", baud, esp_err_to_name(err));
   }
 
+  // FT232BM/R/H baud divisor encoding, port of Linux kernel
+  // drivers/usb/serial/ftdi_sio.c: ftdi_232bm_baud_base_to_divisor.
+  // 14-bit integer divisor with 3-bit fractional part in bits 14..16.
+  static uint32_t ftdi_232bm_baud_to_divisor_(uint32_t baud) {
+    if (baud == 0) baud = 115200;
+    static const uint8_t divfrac[8] = {0, 3, 2, 4, 1, 5, 6, 7};
+    uint32_t divisor3 = (48000000UL / 2) / baud;   // base 48 MHz, /2 in HW
+    uint32_t div = divisor3 >> 3;
+    div |= (uint32_t)divfrac[divisor3 & 0x7] << 14;
+    if (div == 1) div = 0;                // 3.0 MBaud special case
+    else if (div == 0x4001) div = 1;      // 2.0 MBaud special case
+    return div;
+  }
+
   void ftdi_init_(DeviceConnection *conn) {
     auto vc = [&](uint8_t req, uint16_t val, uint16_t idx) -> esp_err_t {
       return ctrl_transfer_sync_(conn->dev_hdl,
@@ -878,9 +908,15 @@ class UsbBridgeComponent : public Component {
     err = vc(FTDI_REQ_RESET, 1, conn->config.interface);   // Purge RX
     err = vc(FTDI_REQ_RESET, 2, conn->config.interface);   // Purge TX
 
-    uint16_t baud_val = (conn->config.baud_rate > 0) ? (3000000 / conn->config.baud_rate) : 26;
-    err = vc(FTDI_REQ_SET_BAUDRATE, baud_val, conn->config.interface);
-    BRIDGE_LOG("    FTDI SET_BAUDRATE(val=%d -> %d baud): %s", baud_val, conn->config.baud_rate, esp_err_to_name(err));
+    // SET_BAUDRATE: divisor low 16 bits in wValue; top bits + port go in wIndex.
+    // Low byte of wIndex carries the port (interface) for multi-port chips;
+    // for single-port chips it's 0. High byte carries the overflow divisor bit.
+    uint32_t div = ftdi_232bm_baud_to_divisor_(conn->config.baud_rate);
+    uint16_t baud_val = (uint16_t)(div & 0xFFFF);
+    uint16_t baud_idx = (uint16_t)(((div >> 8) & 0xFF00) | (conn->config.interface & 0xFF));
+    err = vc(FTDI_REQ_SET_BAUDRATE, baud_val, baud_idx);
+    BRIDGE_LOG("    FTDI SET_BAUDRATE(div=0x%05X -> %d baud): %s",
+               (unsigned)div, conn->config.baud_rate, esp_err_to_name(err));
 
     err = vc(FTDI_REQ_SET_DATA, 0x0008, conn->config.interface);  // 8N1
     BRIDGE_LOG("    FTDI SET_DATA(8N1): %s", esp_err_to_name(err));
@@ -919,12 +955,12 @@ class UsbBridgeComponent : public Component {
         uint8_t addr = conn->dev_addr;
         BRIDGE_LOGW("Device disconnected: %s (addr=%d, port=%d)", conn->config.name, addr, conn->config.port);
         conn->connected.store(false);
-        xSemaphoreTake(conn->usb_mutex, portMAX_DELAY);
+        xSemaphoreTakeRecursive(conn->usb_mutex, portMAX_DELAY);
         usb_host_interface_release(client_hdl_, dev, conn->claimed_intf);
         usb_host_device_close(client_hdl_, dev);
         conn->dev_hdl = nullptr;
         conn->dev_addr = 0;
-        xSemaphoreGive(conn->usb_mutex);
+        xSemaphoreGiveRecursive(conn->usb_mutex);
         conn->chip_type = ChipType::UNKNOWN;
 
         xSemaphoreTake(discovery_mutex_, portMAX_DELAY);
@@ -1005,12 +1041,18 @@ class UsbBridgeComponent : public Component {
   }
   void usb_task_() {
     while (true) {
-      // Process pending client events (device connect/disconnect callbacks)
-      usb_host_client_handle_events(client_hdl_, pdMS_TO_TICKS(100));
+      // Snapshot the handle so a concurrent cold-boot-retry (which nulls
+      // client_hdl_ before deregister) can't send us into the API with a
+      // freshly invalidated pointer.
+      auto hdl = client_hdl_;
+      if (!hdl) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        continue;
+      }
+      usb_host_client_handle_events(hdl, pdMS_TO_TICKS(100));
 
-      // Check for queued new-device addresses
       uint8_t addr;
-      while (xQueueReceive(new_dev_queue_, &addr, 0) == pdTRUE) {
+      while (client_hdl_ && xQueueReceive(new_dev_queue_, &addr, 0) == pdTRUE) {
         handle_new_device_(addr);
       }
     }
@@ -1018,13 +1060,13 @@ class UsbBridgeComponent : public Component {
 
   // ── TCP -> USB write ──────────────────────────────────────
   void usb_write_(DeviceConnection *conn, const uint8_t *data, size_t len) {
-    xSemaphoreTake(conn->usb_mutex, portMAX_DELAY);
+    xSemaphoreTakeRecursive(conn->usb_mutex, portMAX_DELAY);
     if (!conn->dev_hdl || !conn->connected.load()) {
-      xSemaphoreGive(conn->usb_mutex); return;
+      xSemaphoreGiveRecursive(conn->usb_mutex); return;
     }
     usb_transfer_t *xfer;
     if (usb_host_transfer_alloc(len, 0, &xfer) != ESP_OK) {
-      xSemaphoreGive(conn->usb_mutex); return;
+      xSemaphoreGiveRecursive(conn->usb_mutex); return;
     }
     memcpy(xfer->data_buffer, data, len);
     xfer->device_handle = conn->dev_hdl;
@@ -1034,7 +1076,7 @@ class UsbBridgeComponent : public Component {
     xfer->num_bytes = len;
     xfer->timeout_ms = 1000;
     if (usb_host_transfer_submit(xfer) != ESP_OK) usb_host_transfer_free(xfer);
-    xSemaphoreGive(conn->usb_mutex);
+    xSemaphoreGiveRecursive(conn->usb_mutex);
   }
 
   static void bulk_out_cb_(usb_transfer_t *xfer) {
@@ -1371,7 +1413,9 @@ static esp_err_t handle_post_config_(httpd_req_t *req) {
   while (*ptr) {
     const char *obj_start = strchr(ptr, '{');
     if (!obj_start) break;
-    const char *obj_end = strchr(obj_start, '}');
+    // Use brace-aware finder so device names/serials containing '}' or
+    // escaped quotes don't split the object prematurely.
+    const char *obj_end = json_find_obj_end(obj_start);
     if (!obj_end) break;
 
     char obj[512];
