@@ -393,9 +393,7 @@ function renderConfigs(){
       <div class="dev-info">VID: ${hex4(d.vid)} &middot; PID: ${hex4(d.pid)}${d.serial?' &middot; S/N: '+esc(d.serial):''}</div>
       <div class="row">
         <div><label>TCP Port</label><input type="number" value="${d.port}" onchange="configs[${i}].port=parseInt(this.value)||8880;dirty=true" min="1024" max="65535"></div>
-        <div><label>Baud Rate</label><select onchange="configs[${i}].baud_rate=parseInt(this.value);dirty=true">
-          ${BAUDS.map(b=>`<option value="${b}"${b===d.baud_rate?' selected':''}>${b}</option>`).join('')}
-        </select></div>
+        <div>${baudField(i,d)}</div>
         <div><label>Interface</label><input type="number" value="${d.interface||0}" onchange="configs[${i}].interface=parseInt(this.value)||0;dirty=true" min="0" max="10"></div>
         <div class="chk"><input type="checkbox" id="ab${i}" ${d.autoboot?'checked':''} onchange="configs[${i}].autoboot=this.checked;dirty=true"><label for="ab${i}" style="color:#e0e0e0">Autoboot</label></div>
       </div>
@@ -405,6 +403,31 @@ function renderConfigs(){
       <div class="actions"><button class="btn btn-danger" onclick="removeConfig(${i})">Remove</button></div>
     </div>`;
   });
+}
+
+// Baud rate field: preset dropdown + free "Custom…" input for uncommon
+// speeds (e.g. 125000 for Warema WMS). Backend already accepts any value.
+function baudField(i,d){
+  const isCustom=!BAUDS.includes(d.baud_rate);
+  const opts=BAUDS.map(b=>`<option value="${b}"${b===d.baud_rate?' selected':''}>${b}</option>`).join('')
+    +`<option value="custom"${isCustom?' selected':''}>Custom…</option>`;
+  return `<label>Baud Rate</label>
+    <select onchange="onBaudSelect(${i},this)">${opts}</select>
+    <input type="number" class="baud-custom" value="${d.baud_rate}" min="1" max="4000000"
+      style="margin-top:4px;display:${isCustom?'block':'none'}" placeholder="Custom baud"
+      oninput="configs[${i}].baud_rate=parseInt(this.value)||0;dirty=true">`;
+}
+function onBaudSelect(i,sel){
+  const custom=sel.parentNode.querySelector('.baud-custom');
+  if(sel.value==='custom'){
+    custom.style.display='block';
+    configs[i].baud_rate=parseInt(custom.value)||0;
+    custom.focus();
+  }else{
+    custom.style.display='none';
+    configs[i].baud_rate=parseInt(sel.value);
+  }
+  dirty=true;
 }
 
 document.getElementById('discovered').addEventListener('click',e=>{
