@@ -86,9 +86,13 @@ usb_bridge:
         name: "Device 1 Port"
       device_status:
         name: "Device 1 Status"
+      device_baud:
+        name: "Device 1 Baud"
     - device_name:
         name: "Device 2 Name"
       device_port:
         name: "Device 2 Port"
       device_status:
         name: "Device 2 Status"
+      device_baud:
+        name: "Device 2 Baud"

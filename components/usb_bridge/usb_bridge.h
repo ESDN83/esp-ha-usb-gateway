@@ -230,6 +230,9 @@ class UsbBridgeComponent : public Component {
   void set_device_status_sensor(int index, text_sensor::TextSensor *sensor) {
     if (index >= 0 && index < MAX_DEVICE_SLOTS) device_status_sensors_[index] = sensor;
   }
+  void set_device_baud_sensor(int index, text_sensor::TextSensor *sensor) {
+    if (index >= 0 && index < MAX_DEVICE_SLOTS) device_baud_sensors_[index] = sensor;
+  }
 #endif
 
   float get_setup_priority() const override {
@@ -446,6 +449,7 @@ class UsbBridgeComponent : public Component {
   text_sensor::TextSensor *device_name_sensors_[MAX_DEVICE_SLOTS]{};
   text_sensor::TextSensor *device_port_sensors_[MAX_DEVICE_SLOTS]{};
   text_sensor::TextSensor *device_status_sensors_[MAX_DEVICE_SLOTS]{};
+  text_sensor::TextSensor *device_baud_sensors_[MAX_DEVICE_SLOTS]{};
   bool config_url_published_{false};
 #endif
   uint32_t last_sensor_publish_{0};
@@ -1123,9 +1127,10 @@ class UsbBridgeComponent : public Component {
         }
       }
     }
-    // Per-device sensors: name, port, status for each configured slot
+    // Per-device sensors: name, port, status, baud for each configured slot
     for (int i = 0; i < MAX_DEVICE_SLOTS; i++) {
-      if (!device_name_sensors_[i] && !device_port_sensors_[i] && !device_status_sensors_[i])
+      if (!device_name_sensors_[i] && !device_port_sensors_[i] &&
+          !device_status_sensors_[i] && !device_baud_sensors_[i])
         continue;
 
       if (i < (int)connections_.size()) {
@@ -1139,6 +1144,11 @@ class UsbBridgeComponent : public Component {
         }
         if (device_status_sensors_[i])
           device_status_sensors_[i]->publish_state(conn->connected.load() ? "Connected" : "Disconnected");
+        if (device_baud_sensors_[i]) {
+          char baud_str[12];
+          snprintf(baud_str, sizeof(baud_str), "%d", conn->config.baud_rate);
+          device_baud_sensors_[i]->publish_state(baud_str);
+        }
       } else {
         if (device_name_sensors_[i])
           device_name_sensors_[i]->publish_state("—");
@@ -1146,6 +1156,8 @@ class UsbBridgeComponent : public Component {
           device_port_sensors_[i]->publish_state("—");
         if (device_status_sensors_[i])
           device_status_sensors_[i]->publish_state("No Device");
+        if (device_baud_sensors_[i])
+          device_baud_sensors_[i]->publish_state("—");
       }
     }
 #endif

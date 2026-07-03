@@ -21,6 +21,7 @@ MAX_DEVICE_SLOTS = 8
 CONF_DEVICE_NAME = "device_name"
 CONF_DEVICE_PORT = "device_port"
 CONF_DEVICE_STATUS = "device_status"
+CONF_DEVICE_BAUD = "device_baud"
 
 DEVICE_SENSOR_SCHEMA = cv.Schema(
     {
@@ -32,6 +33,10 @@ DEVICE_SENSOR_SCHEMA = cv.Schema(
         ),
         cv.Required(CONF_DEVICE_STATUS): text_sensor.text_sensor_schema(
             icon="mdi:lan-check",
+        ),
+        cv.Optional(CONF_DEVICE_BAUD): text_sensor.text_sensor_schema(
+            icon="mdi:speedometer",
+            entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
         ),
     }
 )
@@ -95,6 +100,9 @@ async def to_code(config):
             cg.add(var.set_device_port_sensor(i, port_sens))
             status_sens = await text_sensor.new_text_sensor(dev_conf[CONF_DEVICE_STATUS])
             cg.add(var.set_device_status_sensor(i, status_sens))
+            if CONF_DEVICE_BAUD in dev_conf:
+                baud_sens = await text_sensor.new_text_sensor(dev_conf[CONF_DEVICE_BAUD])
+                cg.add(var.set_device_baud_sensor(i, baud_sens))
 
     # Tell ESPHome API that our config UI is on port 80
     # so HA shows the "Visit" button on the device page.
