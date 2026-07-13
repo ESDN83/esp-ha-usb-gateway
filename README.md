@@ -274,3 +274,15 @@ MIT
 - [ESPHome](https://esphome.io/) framework
 - [ESP-IDF](https://github.com/espressif/esp-idf) USB Host library
 - Inspired by [HB-RF-ETH-ng](https://github.com/Xerolux/HB-RF-ETH-ng) and [SLZB-MR5U](https://smlight.tech/)
+
+---
+
+## 🔗 More Projects by ESDN83
+
+| Project | Description |
+|---------|-------------|
+| [HA_enoceanmqtt-addon-ui](https://github.com/ESDN83/HA_enoceanmqtt-addon-ui) | EnOcean MQTT Home Assistant add-on with Web UI — visual device wizard, 96+ EEP profiles, MQTT auto-discovery, Eltako actuator control |
+| [esp-cyberpower-ups](https://github.com/ESDN83/esp-cyberpower-ups) | ESP32-S3 CyberPower UPS monitor via USB HID — native ESPHome component, direct Home Assistant integration |
+| [heizung-vitoconnect](https://github.com/ESDN83/heizung-vitoconnect) | ESPHome Vitoconnect replacement for Viessmann heating (WT32-ETH01 + Optolink) with Home Assistant integration |
+| [Home-Solar-Portable-emergency-charger](https://github.com/ESDN83/Home-Solar-Portable-emergency-charger) | DIY portable emergency charger for PV home battery systems (E3DC / Victron compatible) |
+| [HA-Blueprints](https://github.com/ESDN83/HA-Blueprints) | Home Assistant automation blueprints — EnOcean PTM 215Z dimming & color scenes via Zigbee2MQTT |
