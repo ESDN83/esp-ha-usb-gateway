@@ -500,7 +500,7 @@ class UsbBridgeComponent : public Component {
       conn->usb_mutex = xSemaphoreCreateRecursiveMutex();
       connections_.push_back(conn);
       BRIDGE_LOG("  Config: %s VID=%04X PID=%04X S/N=%s port=%d baud=%d",
-               s.name, s.vid, s.pid, s.serial[0] ? s.serial : "(none)", s.port, s.baud_rate);
+               s.name, s.vid, s.pid, s.serial[0] ? s.serial : "(none)", s.port, (int) s.baud_rate);
     }
   }
 
@@ -882,7 +882,7 @@ class UsbBridgeComponent : public Component {
 
     uint32_t baud = conn->config.baud_rate;
     err = vc(CP210X_SET_BAUDRATE, 0, conn->config.interface, 4, (const uint8_t*)&baud);
-    BRIDGE_LOG("    CP210X SET_BAUDRATE(%d): %s", baud, esp_err_to_name(err));
+    BRIDGE_LOG("    CP210X SET_BAUDRATE(%d): %s", (int) baud, esp_err_to_name(err));
   }
 
   // FT232BM/R/H baud divisor encoding, port of Linux kernel
@@ -944,7 +944,7 @@ class UsbBridgeComponent : public Component {
     esp_err_t err = ctrl_transfer_sync_out_(conn->dev_hdl,
         USB_BM_REQUEST_TYPE_DIR_OUT | USB_BM_REQUEST_TYPE_TYPE_CLASS | USB_BM_REQUEST_TYPE_RECIP_INTERFACE,
         CDC_SET_LINE_CODING, 0, conn->config.interface, 7, data);
-    BRIDGE_LOG("    CDC SET_LINE_CODING(%d 8N1): %s", baud, esp_err_to_name(err));
+    BRIDGE_LOG("    CDC SET_LINE_CODING(%d 8N1): %s", (int) baud, esp_err_to_name(err));
 
     err = ctrl_transfer_sync_out_(conn->dev_hdl,
         USB_BM_REQUEST_TYPE_DIR_OUT | USB_BM_REQUEST_TYPE_TYPE_CLASS | USB_BM_REQUEST_TYPE_RECIP_INTERFACE,
@@ -1010,14 +1010,14 @@ class UsbBridgeComponent : public Component {
       if (err != ESP_OK) {
         if (conn->connected.load()) {
           rx_errors++;
-          BRIDGE_LOGW("Bulk IN submit failed port %d: %s (errors=%u)", conn->config.port, esp_err_to_name(err), rx_errors);
+          BRIDGE_LOGW("Bulk IN submit failed port %d: %s (errors=%u)", conn->config.port, esp_err_to_name(err), (unsigned) rx_errors);
         }
         break;
       }
       xSemaphoreTake(conn->bulk_in_sem, portMAX_DELAY);
     }
 
-    BRIDGE_LOG("Bulk read task ended for %s (rx=%u bytes, errors=%u)", conn->config.name, rx_bytes, rx_errors);
+    BRIDGE_LOG("Bulk read task ended for %s (rx=%u bytes, errors=%u)", conn->config.name, (unsigned) rx_bytes, (unsigned) rx_errors);
     usb_host_transfer_free(xfer);
     if (conn->bulk_in_sem) { vSemaphoreDelete(conn->bulk_in_sem); conn->bulk_in_sem = nullptr; }
     vTaskDelete(nullptr);
@@ -1451,7 +1451,7 @@ static esp_err_t handle_post_config_(httpd_req_t *req) {
       devs.push_back(cfg);
       BRIDGE_LOG("POST config: %s VID=%04X PID=%04X S/N=%s port=%d baud=%d intf=%d autoboot=%d",
                cfg.name, cfg.vid, cfg.pid, cfg.serial[0] ? cfg.serial : "(none)",
-               cfg.port, cfg.baud_rate, cfg.interface, cfg.autoboot);
+               cfg.port, (int) cfg.baud_rate, cfg.interface, cfg.autoboot);
     }
     ptr = obj_end + 1;
   }
