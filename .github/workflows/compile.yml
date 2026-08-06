@@ -1,0 +1,58 @@
+name: Compile
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'components/**'
+      - 'esphome/**'
+      - '.github/workflows/compile.yml'
+  pull_request:
+    paths:
+      - 'components/**'
+      - 'esphome/**'
+      - '.github/workflows/compile.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: compile-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Bump deliberately, so a red build always means this repo changed and never
+  # that ESPHome upstream did.
+  ESPHOME_VERSION: "2026.7.4"
+
+jobs:
+  compile:
+    name: esp32-s3 / esp-idf
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Cache ESP-IDF toolchain and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.espressif
+            esphome/.esphome
+          key: esphome-${{ env.ESPHOME_VERSION }}-${{ hashFiles('esphome/ci-compile.yaml') }}
+          restore-keys: |
+            esphome-${{ env.ESPHOME_VERSION }}-
+
+      - name: Install ESPHome
+        run: pip install "esphome==${ESPHOME_VERSION}"
+
+      - name: Validate configuration
+        run: esphome config esphome/ci-compile.yaml
+
+      - name: Compile
+        run: esphome compile esphome/ci-compile.yaml

@@ -1,0 +1,91 @@
+# Build-only configuration for CI.
+#
+# Differs from usb-bridge.yaml in exactly two ways that matter:
+#   1. external_components points at ../components, so CI compiles the code in
+#      this checkout instead of pulling master from GitHub. A pull request must
+#      be built from its own sources, otherwise the check is meaningless.
+#   2. No !secret values, so it builds on a runner without a secrets.yaml.
+#
+# The credentials below are placeholders for a firmware that is compiled and
+# thrown away. Never flash this file.
+
+esphome:
+  name: usb-bridge-ci
+  friendly_name: USB TCP Bridge CI
+  platformio_options:
+    board_build.flash_mode: dio
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  framework:
+    type: esp-idf
+    version: recommended
+    sdkconfig_options:
+      CONFIG_USB_OTG_SUPPORTED: "y"
+      CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE: "1024"
+      CONFIG_LWIP_MAX_SOCKETS: "20"
+
+external_components:
+  - source:
+      type: local
+      path: ../components
+    components: [usb_bridge]
+
+wifi:
+  ssid: "ci-build-only"
+  password: "ci-build-only"
+
+logger:
+  level: DEBUG
+  hardware_uart: UART0  # USB_SERIAL_JTAG blocks GPIO19/20 needed for USB host
+
+safe_mode:
+  boot_is_good_after: 5s
+  num_attempts: 20
+
+api:
+  encryption:
+    key: "Q79IM9oaSoq90655lYmZXByeyRv/aP+Fy9R4KLdr8KE="
+
+ota:
+  - platform: esphome
+    password: "ci-build-only"
+
+sensor:
+  - platform: uptime
+    name: Uptime
+    entity_category: diagnostic
+
+button:
+  - platform: restart
+    name: Restart
+
+# Two device slots with every optional sensor present, so each generated code
+# path in the component is exercised by the build.
+usb_bridge:
+  devices_connected:
+    name: "Devices Connected"
+  firmware:
+    name: "Firmware"
+  config_url:
+    name: "Config URL"
+  ip_address:
+    name: "IP Address"
+  devices:
+    - device_name:
+        name: "Device 1 Name"
+      device_port:
+        name: "Device 1 Port"
+      device_status:
+        name: "Device 1 Status"
+      device_baud:
+        name: "Device 1 Baud"
+    - device_name:
+        name: "Device 2 Name"
+      device_port:
+        name: "Device 2 Port"
+      device_status:
+        name: "Device 2 Status"
+      device_baud:
+        name: "Device 2 Baud"
