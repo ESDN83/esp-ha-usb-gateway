@@ -53,6 +53,13 @@ static constexpr uint8_t CP210X_SET_BAUDRATE = 0x1E;
 static constexpr uint8_t CDC_SET_LINE_CODING = 0x20;
 static constexpr uint8_t CDC_SET_CONTROL_LINE_STATE = 0x22;
 
+// CDC Communications subclass that owns the ACM class requests
+static constexpr uint8_t CDC_SUBCLASS_ACM = 0x02;
+
+// Sentinel: no CDC Communications interface found. Cannot be 0, that is a
+// perfectly normal control interface number.
+static constexpr uint8_t CTRL_INTF_NONE = 0xFF;
+
 #ifndef USB_CLASS_CDC
 #define USB_CLASS_CDC 0x02
 #endif
@@ -177,7 +184,7 @@ struct DeviceConnection {
   uint8_t bulk_out_ep{0};
   uint16_t bulk_in_mps{64};
   uint8_t claimed_intf{0};
-  uint8_t ctrl_intf{0};
+  uint8_t ctrl_intf{CTRL_INTF_NONE};
   ChipType chip_type{ChipType::UNKNOWN};
 
   std::atomic<bool> connected{false};
@@ -643,8 +650,12 @@ class UsbBridgeComponent : public Component {
 
     target->chip_type = detect_chip_type_(desc, config_desc, &target->ctrl_intf);
     BRIDGE_LOG("  Chip type: %s", chip_type_str(target->chip_type));
-    if (target->chip_type == ChipType::CDC_ACM)
-      BRIDGE_LOG("  CDC control interface: %d", target->ctrl_intf);
+    if (target->chip_type == ChipType::CDC_ACM) {
+      if (target->ctrl_intf == CTRL_INTF_NONE)
+        BRIDGE_LOG("  CDC control interface: none, using data interface");
+      else
+        BRIDGE_LOG("  CDC control interface: %d", target->ctrl_intf);
+    }
 
     if (!find_bulk_endpoints_(target, config_desc)) {
       BRIDGE_LOGW("  No bulk endpoints on intf %d — trying other interfaces...", target->config.interface);
@@ -815,7 +826,11 @@ class UsbBridgeComponent : public Component {
   // ── Detect chip type ──────────────────────────────────────
   ChipType detect_chip_type_(const usb_device_desc_t *desc,
                              const usb_config_desc_t *config_desc,
-                             uint8_t *ctrl_intf_out = nullptr) {
+                             uint8_t *ctrl_intf_out) {
+    // Always clear first: a DeviceConnection is reused across reconnects, so a
+    // value left over from an earlier enumeration must not leak through.
+    if (ctrl_intf_out) *ctrl_intf_out = CTRL_INTF_NONE;
+
     if (desc->idVendor == FTDI_VID) return ChipType::FTDI;
     if (desc->idVendor == CP210X_VID) return ChipType::CP210X;
 
@@ -827,7 +842,12 @@ class UsbBridgeComponent : public Component {
         // The CDC Communications (control) interface owns SET_LINE_CODING /
         // SET_CONTROL_LINE_STATE. Some sticks (e.g. ESP32-S3 USB Serial/JTAG)
         // STALL those class requests when addressed to the data interface.
-        if (ctrl_intf_out && intf->bInterfaceSubClass == 0x02)
+        //
+        // Limitation: the first Communications interface wins. A composite
+        // device with two ACM functions (comm 0/data 1, comm 2/data 3) would
+        // need the CDC Union functional descriptor or the IAD to pair control
+        // and data correctly. All adapters we target are single function.
+        if (ctrl_intf_out && intf->bInterfaceSubClass == CDC_SUBCLASS_ACM)
           *ctrl_intf_out = intf->bInterfaceNumber;
         return ChipType::CDC_ACM;
       }
@@ -956,7 +976,10 @@ class UsbBridgeComponent : public Component {
     // CDC class requests (SET_LINE_CODING / SET_CONTROL_LINE_STATE) belong on
     // the Communications (control) interface, not the data interface. Some
     // devices (ESP32-S3 USB Serial/JTAG) STALL them on the data interface.
-    uint8_t ctrl_intf = conn->ctrl_intf;
+    // If the device exposes no Communications interface, keep the old
+    // behaviour and address the configured (data) interface.
+    uint8_t ctrl_intf = (conn->ctrl_intf == CTRL_INTF_NONE) ? conn->config.interface
+                                                            : conn->ctrl_intf;
     esp_err_t err = ctrl_transfer_sync_out_(conn->dev_hdl,
         USB_BM_REQUEST_TYPE_DIR_OUT | USB_BM_REQUEST_TYPE_TYPE_CLASS | USB_BM_REQUEST_TYPE_RECIP_INTERFACE,
         CDC_SET_LINE_CODING, 0, ctrl_intf, 7, data);
