@@ -32,7 +32,11 @@ namespace esphome {
 namespace usb_bridge {
 
 static const char *const TAG = "usb_bridge";
-static const char *const FW_BUILD_ID = "usb-bridge build 2026-04-11-a";
+
+// Built from compiler macros so it can never go stale. It is reported in the
+// boot log and as the Firmware sensor in Home Assistant, so a hand-maintained
+// string is worse than useless: it silently claims the wrong build.
+static const char *const FW_BUILD_ID = "usb-bridge " __DATE__ " " __TIME__;
 
 // Known USB serial chip vendors
 static constexpr uint16_t FTDI_VID = 0x0403;
