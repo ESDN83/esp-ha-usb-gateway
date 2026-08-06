@@ -177,6 +177,7 @@ struct DeviceConnection {
   uint8_t bulk_out_ep{0};
   uint16_t bulk_in_mps{64};
   uint8_t claimed_intf{0};
+  uint8_t ctrl_intf{0};
   ChipType chip_type{ChipType::UNKNOWN};
 
   std::atomic<bool> connected{false};
@@ -640,8 +641,10 @@ class UsbBridgeComponent : public Component {
       }
     }
 
-    target->chip_type = detect_chip_type_(desc, config_desc);
+    target->chip_type = detect_chip_type_(desc, config_desc, &target->ctrl_intf);
     BRIDGE_LOG("  Chip type: %s", chip_type_str(target->chip_type));
+    if (target->chip_type == ChipType::CDC_ACM)
+      BRIDGE_LOG("  CDC control interface: %d", target->ctrl_intf);
 
     if (!find_bulk_endpoints_(target, config_desc)) {
       BRIDGE_LOGW("  No bulk endpoints on intf %d — trying other interfaces...", target->config.interface);
@@ -811,7 +814,8 @@ class UsbBridgeComponent : public Component {
 
   // ── Detect chip type ──────────────────────────────────────
   ChipType detect_chip_type_(const usb_device_desc_t *desc,
-                             const usb_config_desc_t *config_desc) {
+                             const usb_config_desc_t *config_desc,
+                             uint8_t *ctrl_intf_out = nullptr) {
     if (desc->idVendor == FTDI_VID) return ChipType::FTDI;
     if (desc->idVendor == CP210X_VID) return ChipType::CP210X;
 
@@ -819,7 +823,15 @@ class UsbBridgeComponent : public Component {
     for (int i = 0; i < config_desc->bNumInterfaces; i++) {
       const usb_intf_desc_t *intf = usb_parse_interface_descriptor(config_desc, i, 0, &offset);
       if (!intf) continue;
-      if (intf->bInterfaceClass == USB_CLASS_CDC || intf->bInterfaceClass == USB_CLASS_CDC_DATA)
+      if (intf->bInterfaceClass == USB_CLASS_CDC) {
+        // The CDC Communications (control) interface owns SET_LINE_CODING /
+        // SET_CONTROL_LINE_STATE. Some sticks (e.g. ESP32-S3 USB Serial/JTAG)
+        // STALL those class requests when addressed to the data interface.
+        if (ctrl_intf_out && intf->bInterfaceSubClass == 0x02)
+          *ctrl_intf_out = intf->bInterfaceNumber;
+        return ChipType::CDC_ACM;
+      }
+      if (intf->bInterfaceClass == USB_CLASS_CDC_DATA)
         return ChipType::CDC_ACM;
     }
     return ChipType::GENERIC;
@@ -941,15 +953,21 @@ class UsbBridgeComponent : public Component {
     data[4] = 0;  // 1 stop bit
     data[5] = 0;  // no parity
     data[6] = 8;  // 8 data bits
+    // CDC class requests (SET_LINE_CODING / SET_CONTROL_LINE_STATE) belong on
+    // the Communications (control) interface, not the data interface. Some
+    // devices (ESP32-S3 USB Serial/JTAG) STALL them on the data interface.
+    uint8_t ctrl_intf = conn->ctrl_intf;
     esp_err_t err = ctrl_transfer_sync_out_(conn->dev_hdl,
         USB_BM_REQUEST_TYPE_DIR_OUT | USB_BM_REQUEST_TYPE_TYPE_CLASS | USB_BM_REQUEST_TYPE_RECIP_INTERFACE,
-        CDC_SET_LINE_CODING, 0, conn->config.interface, 7, data);
-    BRIDGE_LOG("    CDC SET_LINE_CODING(%d 8N1): %s", (int) baud, esp_err_to_name(err));
+        CDC_SET_LINE_CODING, 0, ctrl_intf, 7, data);
+    BRIDGE_LOG("    CDC SET_LINE_CODING(%d 8N1) intf=%d: %s", (int) baud, ctrl_intf,
+               esp_err_to_name(err));
 
     err = ctrl_transfer_sync_out_(conn->dev_hdl,
         USB_BM_REQUEST_TYPE_DIR_OUT | USB_BM_REQUEST_TYPE_TYPE_CLASS | USB_BM_REQUEST_TYPE_RECIP_INTERFACE,
-        CDC_SET_CONTROL_LINE_STATE, 0x0003, conn->config.interface, 0, nullptr);
-    BRIDGE_LOG("    CDC SET_CONTROL_LINE_STATE(DTR+RTS): %s", esp_err_to_name(err));
+        CDC_SET_CONTROL_LINE_STATE, 0x0003, ctrl_intf, 0, nullptr);
+    BRIDGE_LOG("    CDC SET_CONTROL_LINE_STATE(DTR+RTS) intf=%d: %s", ctrl_intf,
+               esp_err_to_name(err));
   }
 
   // ── Close USB device ──────────────────────────────────────
