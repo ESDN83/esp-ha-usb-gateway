@@ -30,19 +30,22 @@ jobs:
     timeout-minutes: 45
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      # No cache: pip here. That option derives its key from a Python
+      # dependency file, and this repo has neither requirements.txt nor
+      # pyproject.toml, so it fails the step outright. pip is cached below.
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
-          cache: pip
 
       - name: Cache ESP-IDF toolchain and build
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.platformio
             ~/.espressif
+            ~/.cache/pip
             esphome/.esphome
           key: esphome-${{ env.ESPHOME_VERSION }}-${{ hashFiles('esphome/ci-compile.yaml') }}
           restore-keys: |
