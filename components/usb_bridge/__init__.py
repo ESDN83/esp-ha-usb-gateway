@@ -4,9 +4,9 @@ from esphome.const import CONF_ID, ENTITY_CATEGORY_DIAGNOSTIC
 from esphome.components.esp32 import add_idf_sdkconfig_option
 from esphome.components import sensor, text_sensor
 
-# ESPHome 2026.9.0 stopped building a list of ESP-IDF components by default to cut
-# compile time; esp_http_server is one of them. Older ESPHome versions always built
-# it and do not ship this helper, so keep the import optional.
+# ESPHome 2026.9.0 added esp_http_server to the ESP-IDF components that are
+# excluded from the build by default. include_builtin_idf_component only exists
+# from ESPHome 2026.2.0 on, so keep the import optional.
 try:
     from esphome.components.esp32 import include_builtin_idf_component
 except ImportError:
