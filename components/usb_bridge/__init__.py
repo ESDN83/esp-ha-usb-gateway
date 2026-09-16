@@ -4,6 +4,14 @@ from esphome.const import CONF_ID, ENTITY_CATEGORY_DIAGNOSTIC
 from esphome.components.esp32 import add_idf_sdkconfig_option
 from esphome.components import sensor, text_sensor
 
+# ESPHome 2026.9.0 stopped building a list of ESP-IDF components by default to cut
+# compile time; esp_http_server is one of them. Older ESPHome versions always built
+# it and do not ship this helper, so keep the import optional.
+try:
+    from esphome.components.esp32 import include_builtin_idf_component
+except ImportError:
+    include_builtin_idf_component = None
+
 DEPENDENCIES = ["network"]
 AUTO_LOAD = ["sensor", "text_sensor"]
 CODEOWNERS = []
@@ -115,6 +123,11 @@ async def to_code(config):
     add_idf_sdkconfig_option("CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE", 1024)
 
     # HTTP server for config web UI (port 81)
+    # Without this, web_ui.h dies on ESPHome 2026.9.0+ with
+    # "fatal error: esp_http_server.h: No such file or directory" because the
+    # component is neither built nor listed in the REQUIRES of "src".
+    if include_builtin_idf_component is not None:
+        include_builtin_idf_component("esp_http_server")
     add_idf_sdkconfig_option("CONFIG_HTTPD_MAX_REQ_HDR_LEN", 1024)
     # Default lwIP socket count is low; TCP listeners + httpd + HA polling can hit ENFILE (errno 23) on accept().
     add_idf_sdkconfig_option("CONFIG_LWIP_MAX_SOCKETS", 20)
