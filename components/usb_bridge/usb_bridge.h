@@ -1073,8 +1073,12 @@ class UsbBridgeComponent : public Component {
     if (xfer->status == USB_TRANSFER_STATUS_COMPLETED && xfer->actual_num_bytes > 0) {
       const uint8_t *data = xfer->data_buffer;
       size_t len = xfer->actual_num_bytes;
-      // FTDI prepends 2 modem status bytes per packet
-      if (conn->chip_type == ChipType::FTDI && len > 2) { data += 2; len -= 2; }
+      // FTDI prepends 2 modem status bytes per packet, and with nothing to
+      // send it still delivers a status-only packet every latency period
+      // (16 ms). Those used to pass through as a steady "01 60" stream.
+      if (conn->chip_type == ChipType::FTDI) {
+        if (len <= 2) { len = 0; } else { data += 2; len -= 2; }
+      }
       int fd = conn->tcp_client_fd.load();
       if (fd >= 0 && len > 0) lwip_send(fd, data, len, MSG_DONTWAIT);
     }
